@@ -247,27 +247,40 @@ for n in [32, 64, 128]:
 print("─" * 48)
 
 # ─────────────────────────────────────────
-# 4. Generate Training Data
+# 4. Generate Training Data (Analytical + k²-Normalization)
 # ─────────────────────────────────────────
-print("\n── Generating Snapshots ──────────────────────────────")
+print("\n── Generating Snapshots (Analytical, k²-normalized) ───")
 train_ks = [(k1,k2,k3)
-            for k1 in range(1,5)
-            for k2 in range(1,5)
-            for k3 in range(1,5)]          # 64 snapshots
+            for k1 in range(1,6)
+            for k2 in range(1,6)
+            for k3 in range(1,6)]          # 125 snapshots
+
+def get_k2_scale(k1, k2, k3):
+    """Return normalization factor: k1² + k2² + k3².
+    Analytical solution scales as 1/k², so multiplying by k² normalizes."""
+    return float(k1**2 + k2**2 + k3**2)
 
 U_list = []
+scale_factors = []  # store k² for each snapshot
 for i, (k1,k2,k3) in enumerate(train_ks):
-    u = fom_solve(get_F_3d(k1,k2,k3))
-    U_list.append(u)
+    u = get_exact(k1, k2, k3)              # use analytical solution
+    k2_scale = get_k2_scale(k1, k2, k3)
+    u_normalized = u * k2_scale            # normalize by k²
+    U_list.append(u_normalized)
+    scale_factors.append(k2_scale)
     if (i+1) % 16 == 0:
         print(f"  {i+1}/{len(train_ks)} snapshots done")
 
-U_train = jnp.stack(U_list)               # (64, num_nodes)
+U_train = jnp.stack(U_list)               # (64, num_nodes) — normalized
+scale_factors_train = jnp.array(scale_factors)
 print(f"  Dataset shape: {U_train.shape}")
+print(f"  Scale factors range: [{scale_factors_train.min():.0f}, {scale_factors_train.max():.0f}]")
 
 # Hold out a few cases for validation
 val_ks   = [(1,2,4), (3,1,2), (4,3,2), (2,4,1)]
-U_val    = jnp.stack([fom_solve(get_F_3d(*k)) for k in val_ks])
+U_val_raw = jnp.stack([get_exact(*k) for k in val_ks])
+scale_factors_val = jnp.array([get_k2_scale(*k) for k in val_ks])
+U_val = U_val_raw * scale_factors_val[:, None]  # normalize validation set
 print(f"  Validation snapshots: {len(val_ks)}")
 
 # ─────────────────────────────────────────────────────────────────────
@@ -367,7 +380,7 @@ def relative_l2(u_pred, u_true):
 # 8. Training Loop
 # ─────────────────────────────────────────
 print("\n── Training ──────────────────────────────────────────")
-NUM_EPOCHS  = 10_000
+NUM_EPOCHS  = 20_000
 LOG_EVERY   = 1_000
 
 train_losses = []
@@ -413,18 +426,20 @@ for i, (k1,k2,k3) in enumerate(train_ks):
     u_rec = decode(z)
     train_errs.append(relative_l2(u_rec, U_train[i]))
 
-# Validation reconstruction
+# Validation reconstruction (in normalized space)
 val_errs = []
-print(f"\n  {'Case':<12} {'Rel L2 (rec vs FOM)':>22} {'Rel L2 (rec vs exact)':>24}")
-print("  " + "─"*60)
+print(f"\n  {'Case':<12} {'Rel L2 (normalized)':>22} {'Rel L2 (denorm vs exact)':>26}")
+print("  " + "─"*62)
 for i, (k1,k2,k3) in enumerate(val_ks):
-    z      = encode(U_val[i])
-    u_rec  = decode(z)
-    u_ex   = get_exact(k1,k2,k3)
-    e_fom  = relative_l2(u_rec, U_val[i])
-    e_ex   = relative_l2(u_rec, u_ex)
-    val_errs.append(e_fom)
-    print(f"  ({k1},{k2},{k3}){'':<7} {e_fom:>22.4e} {e_ex:>24.4e}")
+    z      = encode(U_val[i])              # encode normalized input
+    u_rec  = decode(z)                     # reconstructed (normalized)
+    u_ex   = get_exact(k1,k2,k3)           # original scale
+    k2_scale = get_k2_scale(k1,k2,k3)
+    e_norm = relative_l2(u_rec, U_val[i])  # error in normalized space
+    u_rec_denorm = u_rec / k2_scale        # denormalize for comparison
+    e_ex   = relative_l2(u_rec_denorm, u_ex)
+    val_errs.append(e_norm)
+    print(f"  ({k1},{k2},{k3}){'':<7} {e_norm:>22.4e} {e_ex:>26.4e}")
 
 print(f"\n  Mean train reconstruction: {np.mean(train_errs):.4e}")
 print(f"  Mean val   reconstruction: {np.mean(val_errs):.4e}")
@@ -475,46 +490,47 @@ plt.close()
 print(f"  Saved: {OUT / 'loss_curve.png'}")
 
 # ─────────────────────────────────────────
-# 12. Midplane Slice: FOM vs Reconstructed vs Exact
+# 12. Midplane Slice: Analytical vs Reconstructed (denormalized)
 # ─────────────────────────────────────────
 test_show = [(1,2,3), (3,3,3), (4,1,2)]
 
 for k1,k2,k3 in test_show:
-    u_fom = fom_solve(get_F_3d(k1,k2,k3))
-    z     = encode(u_fom)
-    u_rec = decode(z)
     u_ex  = get_exact(k1,k2,k3)
+    k2_scale = get_k2_scale(k1,k2,k3)
+    u_norm = u_ex * k2_scale               # normalize for encoding
+    z     = encode(u_norm)
+    u_rec_norm = decode(z)                 # reconstructed (normalized)
+    u_rec = u_rec_norm / k2_scale          # denormalize
 
-    u_fom_3d = np.array(u_fom).reshape(N,N,N)
-    u_rec_3d = np.array(u_rec).reshape(N,N,N)
     u_ex_3d  = np.array(u_ex ).reshape(N,N,N)
+    u_rec_3d = np.array(u_rec).reshape(N,N,N)
 
     mid = N // 2
     sl  = slice(None), slice(None), mid
 
-    vmin = min(u_fom_3d[sl].min(), u_rec_3d[sl].min(), u_ex_3d[sl].min())
-    vmax = max(u_fom_3d[sl].max(), u_rec_3d[sl].max(), u_ex_3d[sl].max())
+    vmin = min(u_ex_3d[sl].min(), u_rec_3d[sl].min())
+    vmax = max(u_ex_3d[sl].max(), u_rec_3d[sl].max())
     kw   = dict(origin='lower', aspect='auto', cmap='viridis',
                 vmin=vmin, vmax=vmax, extent=[0,L,0,L])
 
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-    for ax, data, title in zip(axes[:3],
-                                [u_fom_3d[sl], u_rec_3d[sl], u_ex_3d[sl]],
-                                ['FOM (CG)', 'Reconstructed', 'Analytical']):
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    for ax, data, title in zip(axes[:2],
+                                [u_ex_3d[sl], u_rec_3d[sl]],
+                                ['Analytical', 'Reconstructed']):
         im = ax.imshow(data.T, **kw)
         ax.set_title(title, fontsize=11)
         ax.set_xlabel('x'); ax.set_ylabel('y')
         plt.colorbar(im, ax=ax, shrink=0.8)
 
-    err = np.abs(u_rec_3d[sl] - u_fom_3d[sl])
-    im  = axes[3].imshow(err.T, origin='lower', aspect='auto',
+    err = np.abs(u_rec_3d[sl] - u_ex_3d[sl])
+    im  = axes[2].imshow(err.T, origin='lower', aspect='auto',
                           cmap='hot', extent=[0,L,0,L])
-    axes[3].set_title('|Rec - FOM|', fontsize=11)
-    axes[3].set_xlabel('x'); axes[3].set_ylabel('y')
-    plt.colorbar(im, ax=axes[3], shrink=0.8)
+    axes[2].set_title('|Rec - Analytical|', fontsize=11)
+    axes[2].set_xlabel('x'); axes[2].set_ylabel('y')
+    plt.colorbar(im, ax=axes[2], shrink=0.8)
 
     fig.suptitle(f'Midplane z={mid*dx:.2f} | k=({k1},{k2},{k3}) | '
-                 f'Rel-L2={relative_l2(u_rec, u_fom):.3e}', fontsize=12)
+                 f'Rel-L2={relative_l2(u_rec, u_ex):.3e}', fontsize=12)
     plt.tight_layout()
     fpath = OUT / f'slice_k{k1}{k2}{k3}.png'
     plt.savefig(fpath, dpi=150, bbox_inches='tight')
@@ -569,11 +585,16 @@ ckpt = {
         grid_size     = N,
         conv_features = (32, 64, 128),
         hidden_dims   = (256, 512),
-    )
+    ),
+    'normalization': {
+        'type': 'k2_scale',
+        'description': 'Multiply input by k1²+k2²+k3² before encoding, divide output after decoding',
+    }
 }
 CKPT_PATH = SCRIPT_DIR / 'checkpoint.pkl'
 with open(CKPT_PATH, 'wb') as f:
     pickle.dump(ckpt, f)
 print(f"\n  Checkpoint saved: {CKPT_PATH}")
-print("  Keys: params, batch_stats, model_cfg")
+print("  Keys: params, batch_stats, model_cfg, normalization")
+print("  Normalization: k²-scaling (multiply by k1²+k2²+k3² before encode, divide after decode)")
 print("  Load with:  import pickle; ck = pickle.load(open('...', 'rb'))")
