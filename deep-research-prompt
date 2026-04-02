@@ -1,0 +1,97 @@
+## Project Overview: NM-ROM with Scalable Autoencoders
+
+---
+
+### The Core Idea
+
+Traditional PDE solvers (FOM) operate on the full discrete grid — 32³ = 32,768 nodes, 64³ = 262,144 nodes, scaling brutally. My approach is to compresses the solution space into a low-dimensional latent manifold using a neural network, then solves the PDE entirely in that small space. 
+The key insight is that PDE solutions for a given problem class (e.g. heat diffusion with Gaussian ICs) don't fill the full high-dimensional space — they live on a much lower-dimensional manifold.
+
+---
+
+### Architecture
+
+```
+High-dim solution  u ∈ R^{N³}
+        │
+        │  Encoder: Conv3D + AttentionPooling
+        ▼
+Latent vector  z ∈ R^{32}
+        │
+        │  Decoder: MLP → CP-factored spatial output
+        ▼
+Reconstructed field  ũ(z) ∈ R^{N³}
+
+Parameter count:
+  Dense AE at 128³  →  4.3 billion
+  Your AE at 128³   →  ~650K         (6600× smaller)
+```
+
+**Encoder** — Conv3D stack with strided convolutions, GroupNorm (not BatchNorm — critical for vmap compatibility), Dropout, and attention pooling. 
+Grid-agnostic: same encoder works at 32³ or 128³ without changing parameter count meaningfully.
+
+**Decoder** — CP (CANDECOMP/PARAFAC) separable factorisation:
+
+$$\tilde{u}(i,j,k) = \mathbf{h}(z) \cdot (W_x[:,i] \odot W_y[:,j] \odot W_z[:,k])$$
+
+Parameters scale as $O(\text{rank} \times N)$ not $O(\text{rank} \times N^3)$. This is what makes large grids feasible. Critically, the final output is still a single matmul $h @ V_\text{eq}$ — so the EQ speed trick is preserved exactly.
+
+---
+
+### The Solve Pipeline
+
+There are two phases:
+
+**Offline (once per problem class):**
+
+```
+1. Generate training snapshots via FOM (CG solver)
+   └─ Poisson: 64 snapshots  (4³ parameter combinations)
+   └─ Heat:    200 trajectories × 51 timesteps = 10,200 snapshots
+   |_ Wave: We will implement soon
+
+2. Train autoencoder on snapshots
+   └─ Loss: relative MSE + gradient term (scale-invariant)
+   └─ Augmentation: linear scaling (αu also solves the PDE)
+
+3. Empirical Quadrature (EQ)
+   └─ Compute integrand G[j,i] = (∂ũ/∂z_j)(i) · R(i) for all snapshots
+   └─ NNLS → sparse weights w ≥ 0 at ~1–4% of nodes
+   └─ Precompute V_eq = W_x[:,ix] ⊙ W_y[:,iy] ⊙ W_z[:,iz]
+      (the sparse decoder weights at EQ stencil points)
+```
+
+**Online (once per new parameter / IC):**
+
+```
+4. Given new parameters (k, κ, IC...), initialise z₀ = encode(u₀)
+
+5. LM-GN solver in latent space at EQ points only
+   └─ Residual:  R_eq(z) = h(z) @ V_eq  →  stencil  →  physics
+   └─ Normal equations:  J^T W J δz = -J^T W R
+   └─ Armijo backtracking + relative convergence criterion
+   └─ lax.while_loop → fully JIT-compiled
+
+6. Decode:  ũ = mask ⊙ D(z*) + u_g
+```
+
+---
+
+### PDEs Implemented
+
+| PDE | Type | Scheme | Parameters | Validation |
+|---|---|---|---|---|
+| **Poisson** | Elliptic, steady | CG direct solve | $k_1,k_2,k_3 \in \{1..4\}$ | Exact analytical solution |
+| **Heat** | Parabolic, time-dep | Backward Euler + CG | Gaussian IC: centers, amplitudes, widths, κ | ROM vs FOM over time |
+| **Wave** | Hyperbolic | — | — | — |
+
+---
+
+### Current Status and Known Issues
+
+**What's working:**
+- Poisson NM-ROM: clean, validated against exact solution, measurable speedup
+- Architecture scales correctly — parameter count confirmed independent of grid size
+- EQ offline phase correctly adapted for heat equation (time-dependent residual)
+- GroupNorm fix resolves the core training failure (BatchNorm + vmap = broken)
+

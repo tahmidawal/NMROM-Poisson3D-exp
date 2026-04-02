@@ -1,0 +1,60 @@
+COMPREHENSIVE GUIDE: NM-ROM FOR THE 2D POISSON EQUATION
+
+This document explains the mathematical and computational workflow for using a physics-informed Neural Autoencoder and Empirical Quadrature (EQ) to hyper-reduce and solve a parameterized 2D Poisson equation.
+
+--------------------------------------------------
+1. THE CORE PROBLEM & MANIFOLD COMPRESSION
+--------------------------------------------------
+We are solving the 2D Poisson equation, -∇²u = F(x, y), parameterized by wave frequencies. A standard Full Order Model (FOM) evaluates this on a massive N=4096 node grid.
+
+* The FOM Objective: Find the state vector 'u' (4096 dimensions) where the physical residual is zero: 
+  R(u) = K * u - F = 0
+
+* The Autoencoder (Compression): We train a neural network to learn a "manifold" of valid physics solutions. This allows us to map the massive 4096-dimensional vector 'u' to a tiny 12-dimensional latent vector 'z': 
+  u ≈ g(z)
+
+* The Reduced Residual: Substituting the neural network into the physics equation yields a compressed, non-linear residual:
+  R_red(z) = K * g(z) - F
+
+--------------------------------------------------
+2. THE GAUSS-NEWTON (GN) SOLVER
+--------------------------------------------------
+Because we compressed the system, we can no longer make all 4096 equations equal exactly zero. We must frame this as a Least-Squares Optimization Problem to find the latent vector 'z' that minimizes the squared physics error.
+
+* Objective: Minimize (1/2) * ||R_red(z)||²
+* The Gradient: The derivative of this objective relies on the Jacobian matrix J_R (the sensitivity of the physics residual to changes in the 12 latent variables): 
+  Gradient = (J_R^T) * R_red(z)
+
+* Levenberg-Marquardt Gauss-Newton Step: Instead of computing a highly expensive second derivative (Hessian), we approximate it as (J_R^T) * J_R. To prevent instability, we add a Tikhonov damping factor (λ*I). We iteratively update the latent space using:
+  [(J_R^T * J_R) + λ*I] * Δz = -(J_R^T) * R_red(z)
+
+--------------------------------------------------
+3. THE BOTTLENECK & EMPIRICAL QUADRATURE (EQ)
+--------------------------------------------------
+The Problem: Calculating (J_R^T) * R_red(z) still requires evaluating the physics residual across all 4096 nodes to sum up the final gradient. This completely defeats the speed advantage of using a 12-dimensional latent space.
+
+The Solution: Empirical Quadrature (EQ) asks if we can find a tiny subset of "magic points" on the grid and assign them specific weights, so we only evaluate the physics at those few points while mathematically achieving the exact same gradient sum.
+Sum [ (J_R)_i^T * R_i ] ≈ Sum [ w_i * (J_R)_i^T * R_i ]
+
+--------------------------------------------------
+4. FINDING THE EQ WEIGHTS VIA NNLS
+--------------------------------------------------
+To find these "magic points," the script stacks the true, exact gradients from a batch of training snapshots and solves for the weights 'w' using Non-Negative Least Squares (NNLS).
+
+* The Matrix Equation: G * w ≈ b
+  - G = A matrix representing the gradient contributions of every single node across all training snapshots (Rows: snapshots x 12 dims, Columns: 4096 nodes).
+  - b = The exact, true gradient stacked for all snapshots.
+  - w = The unknown weights for the 4096 nodes.
+
+* The NNLS Constraint: Minimize ||G * w - b||² subject to w ≥ 0
+  - Standard least squares would assign non-zero (and negative) weights to all 4096 nodes.
+  - By forcing w ≥ 0, the algorithm geometrically projects the solution onto a low-dimensional face of a mathematical cone. 
+  - This naturally enforces massive sparsity. The algorithm assigns a weight of 0.0 to the vast majority of nodes.
+  - The few indices where w > 0 become your EQ points.
+
+--------------------------------------------------
+5. THE FINAL HYPER-REDUCED SOLVER (ONLINE PHASE)
+--------------------------------------------------
+Once the sparse EQ weights are found, the script "amputates" the neural network, discarding any dense weights that don't connect to the chosen EQ points. 
+
+During runtime (the Online Phase), the Gauss-Newton solver strictly evaluates the physics and updates the latent vector 'z' using ONLY the handful of EQ points. Once the optimal 'z' is found, the network runs a single forward pass to decompress the latent vector into the full 4096-node solution—resulting in massive computational speedups with minimal loss in accuracy.
