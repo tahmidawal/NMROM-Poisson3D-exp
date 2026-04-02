@@ -231,7 +231,7 @@ def constrained_decode(z):
 N_EQ_SAMPLES = 50     # Random samples for EQ — 50 is plenty
 N_TRAIN     = meta['n_train']
 traj_kappas = meta['traj_kappas']
-DATA_PATH   = Path('plots/heat_ae/training_data.pkl')
+DATA_PATH   = SCRIPT_DIR / 'plots' / 'training_data.pkl'
 
 print(f"\n--- Loading training snapshots for EQ from cache ---")
 with open(DATA_PATH, 'rb') as f:
