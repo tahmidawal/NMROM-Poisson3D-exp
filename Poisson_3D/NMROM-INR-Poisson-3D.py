@@ -554,10 +554,13 @@ for i, (k1,k2,k3) in enumerate(test_ks):
     F_test = get_F_3d(k1, k2, k3)
     k2_scale = k2_scales[i]
 
-    # FOM (for timing comparison only)
-    t0    = time.perf_counter()
-    u_fom = full_order_fem_solver_3d(F_test).block_until_ready()
-    fom_t = time.perf_counter() - t0
+    # FOM (for timing comparison only) — run 3 times, take median
+    _fom_times_per_case = []
+    for _ in range(3):
+        t0    = time.perf_counter()
+        u_fom = full_order_fem_solver_3d(F_test).block_until_ready()
+        _fom_times_per_case.append(time.perf_counter() - t0)
+    fom_t = float(np.median(_fom_times_per_case))
     fom_times.append(fom_t)
 
     # Use pre-batched ROM result
