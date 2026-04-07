@@ -345,30 +345,79 @@ schedule = optax.warmup_cosine_decay_schedule(
     init_value   = 0.0,
     peak_value   = 1e-3,
     warmup_steps = 500,
-    decay_steps  = 30_000,
+    decay_steps  = 40_000,
     end_value    = 1e-5,
 )
 tx        = optax.adam(schedule)
 opt_state = tx.init(params)
 
 # ─────────────────────────────────────────────────────────────────────
-# 7. Training Step
+# 7. Precompute midpoint targets for latent interpolation regularization.
+#
+# For a random subset of pairs (i, j) from the integer training set,
+# precompute the analytical midpoint solution. The regularization loss
+# penalizes: ||decode(0.5*(encode(u_i)+encode(u_j))) - u_mid_true||²
+#
+# We use integer-only pairs because those have exact midpoints near test cases.
+# ─────────────────────────────────────────────────────────────────────
+print("  Building midpoint targets for interpolation regularization...")
+_rng_mid = np.random.RandomState(7)
+_N_pairs  = 64  # number of pairs per regularization batch
+_int_idx  = list(range(len(train_ks_int)))  # only integer-k pairs
+_pairs    = []
+while len(_pairs) < _N_pairs:
+    i_, j_ = _rng_mid.choice(_int_idx, 2, replace=False)
+    k_i = train_ks[i_]; k_j = train_ks[j_]
+    _pairs.append((i_, j_, k_i, k_j))
+
+# Precompute analytical midpoint solutions (in normalized space)
+U_mid_true = []
+for (i_, j_, k_i, k_j) in _pairs:
+    km = tuple((ki + kj) / 2 for ki, kj in zip(k_i, k_j))
+    k2_m = get_k2_scale(*km)
+    u_m = get_exact(*km) * k2_m
+    U_mid_true.append(u_m)
+U_mid_true = jnp.stack(U_mid_true)  # (N_pairs, num_nodes)
+pair_i = jnp.array([p[0] for p in _pairs])
+pair_j = jnp.array([p[1] for p in _pairs])
+print(f"  {_N_pairs} midpoint pairs precomputed.")
+
+INTERP_LAMBDA = 0.5  # weight on interpolation regularization loss
+
+# ─────────────────────────────────────────────────────────────────────
+# Training Step
 #
 # Two things happen each step:
 #   a) params  ← updated by Adam via value_and_grad
 #   b) batch_stats ← updated by BatchNorm (returned as mutable output)
+#
+# Combined loss = reconstruction + λ * latent_interpolation_regularization
 # ─────────────────────────────────────────────────────────────────────
 @jax.jit
-def train_step(params, batch_stats, opt_state, batch):
+def train_step(params, batch_stats, opt_state, batch, u_mid, p_i, p_j):
     def loss_fn(p):
         # vmap over batch, no mutable — use current batch_stats read-only
-        preds = jax.vmap(
-            lambda u: model.apply(
-                {'params': p, 'batch_stats': batch_stats},
-                u, training=False,   # read-only stats during grad
-            )
-        )(batch)
-        return jnp.mean((batch - preds) ** 2)
+        apply_fn = lambda u: model.apply(
+            {'params': p, 'batch_stats': batch_stats}, u, training=False)
+        preds = jax.vmap(apply_fn)(batch)
+        rec_loss = jnp.mean((batch - preds) ** 2)
+
+        # Latent interpolation regularization:
+        # encode pairs, decode midpoint latent, compare with precomputed u_mid
+        encode_fn = lambda u: model.apply(
+            {'params': p, 'batch_stats': batch_stats},
+            u, training=False, method=model.encode)
+        decode_fn = lambda z: model.apply(
+            {'params': p, 'batch_stats': batch_stats},
+            z, method=model.decode)
+
+        z_i = jax.vmap(encode_fn)(batch[p_i])   # (N_pairs, k_dim)
+        z_j = jax.vmap(encode_fn)(batch[p_j])   # (N_pairs, k_dim)
+        z_mid = 0.5 * (z_i + z_j)
+        u_pred_mid = jax.vmap(decode_fn)(z_mid)  # (N_pairs, num_nodes)
+        interp_loss = jnp.mean((u_pred_mid - u_mid) ** 2)
+
+        return rec_loss + INTERP_LAMBDA * interp_loss
 
     loss, grads          = jax.value_and_grad(loss_fn)(params)
     updates, new_opt_state = tx.update(grads, opt_state, params)
@@ -404,7 +453,7 @@ def relative_l2(u_pred, u_true):
 # 8. Training Loop
 # ─────────────────────────────────────────
 print("\n── Training ──────────────────────────────────────────")
-NUM_EPOCHS  = 30_000
+NUM_EPOCHS  = 40_000
 LOG_EVERY   = 1_000
 
 train_losses = []
@@ -413,7 +462,8 @@ t0_train     = time.perf_counter()
 
 for epoch in range(NUM_EPOCHS + 1):
     params, batch_stats, opt_state, loss = train_step(
-        params, batch_stats, opt_state, U_train
+        params, batch_stats, opt_state, U_train,
+        U_mid_true, pair_i, pair_j
     )
 
     if epoch % LOG_EVERY == 0:
