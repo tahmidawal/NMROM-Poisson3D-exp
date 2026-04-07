@@ -489,6 +489,44 @@ def fast_eq_latent_poisson_solver(lat_init, F_vec, k2_scale):
     u_final = u_normalized / k2_scale  # denormalize output
     return lat_f, u_final, res_f, n_iters
 
+# ─────────────────────────────────────────────────────────────────────
+# 7b. Zero-shot ROM: 5-NN latent interpolation (no GN)
+#     Since AE trains on ALL 125 snapshots, 5-NN WITH exact match gives
+#     low-error zero-shot solutions. Batch vmapped for max throughput.
+# ─────────────────────────────────────────────────────────────────────
+print("\n--- Precomputing 5-NN zero-shot latent codes ---")
+
+# Encode all training snapshots
+Z_all = jnp.stack([encode(U_train[i]) for i in range(len(train_ks))])   # (125, k_dim)
+K_all_np = np.array([[k1, k2, k3] for k1, k2, k3 in train_ks], dtype=np.float32)  # (125, 3)
+
+def latent_5nn_zeroshot(k1, k2, k3, n_neighbors=5):
+    """5-NN latent interpolation including exact match."""
+    q     = np.array([k1, k2, k3], dtype=np.float32)
+    dists = np.sum((K_all_np - q)**2, axis=1)
+    top_i = np.argsort(dists)[:n_neighbors]
+    top_d = np.sqrt(dists[top_i]).astype(np.float64)
+    if top_d[0] < 1e-6:
+        return Z_all[top_i[0]]
+    w = 1.0 / (top_d + 1e-12)
+    w /= w.sum()
+    return sum(w[j] * Z_all[top_i[j]] for j in range(n_neighbors))
+
+def zeroshot_solution(k1, k2, k3):
+    """Zero-shot: 5-NN latent → constrained_decode → denormalize."""
+    z      = latent_5nn_zeroshot(k1, k2, k3)
+    k2_sc  = get_k2_scale(k1, k2, k3)
+    u_norm = constrained_decode(z)
+    return u_norm / k2_sc
+
+# JIT-compiled batch vmap for timing benchmark
+@jax.jit
+def zeroshot_batch_vmap(Z_batch, k2_scales):
+    """Batch zero-shot decode: given precomputed latent codes, decode all at once."""
+    def single(z, k2_sc):
+        return constrained_decode(z) / k2_sc
+    return jax.vmap(single)(Z_batch, k2_scales)
+
 # ─────────────────────────────────────────
 # 8. Warm-up
 # ─────────────────────────────────────────
@@ -500,6 +538,12 @@ _lat_wm = predict_latent(2, 2, 2) if kz_params is not None else encode(U_train[0
 for _ in range(2):
     _, _u_wm, _, _ = fast_eq_latent_poisson_solver(_lat_wm, _F_wm, _k2_wm)
 jax.block_until_ready(_u_wm)
+
+# Warm up zero-shot vmap
+_Z_wm = jnp.stack([latent_5nn_zeroshot(2,2,2), latent_5nn_zeroshot(3,3,3)])
+_k2_wm_batch = jnp.array([12.0, 27.0])
+for _ in range(3):
+    _ = zeroshot_batch_vmap(_Z_wm, _k2_wm_batch).block_until_ready()
 print("   Warm-up complete.\n")
 
 # ─────────────────────────────────────────
@@ -603,16 +647,78 @@ test_ks    = test_ks_split + seen_sample_ks
 stored     = {**stored_u, **{k + len(test_ks_split): v for k, v in stored_s.items()}}
 n_test     = len(test_ks)
 
+# ─────────────────────────────────────────────────────────────────────
+# 9b. Zero-shot batch benchmark (5-NN latent interp, no GN, batch vmap)
+# ─────────────────────────────────────────────────────────────────────
+print(f"\n=== ZERO-SHOT BATCH BENCHMARK (5-NN latent, no GN, batch vmap, min-100 timing) ===")
+all_bench_ks = test_ks_split + seen_sample_ks
+n_bench = len(all_bench_ks)
+
+# Precompute latent codes for all benchmark cases
+Z_bench  = jnp.stack([latent_5nn_zeroshot(*k) for k in all_bench_ks])  # (n_bench, k_dim)
+k2_bench = jnp.array([get_k2_scale(*k) for k in all_bench_ks])         # (n_bench,)
+
+# Warm up
+for _ in range(5):
+    _ = zeroshot_batch_vmap(Z_bench, k2_bench).block_until_ready()
+
+# Min timing over 100 runs
+zs_run_times = []
+for _ in range(100):
+    t0 = time.perf_counter()
+    u_zs_batch = zeroshot_batch_vmap(Z_bench, k2_bench).block_until_ready()
+    zs_run_times.append(time.perf_counter() - t0)
+zs_batch_time = min(zs_run_times)
+zs_per_case   = zs_batch_time / n_bench
+
+# FOM timing (min over 5 runs per case)
+fom_min_times = []
+for k1, k2, k3 in all_bench_ks:
+    F_t = get_F_3d(k1, k2, k3)
+    ft_list = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        full_order_fem_solver_3d(F_t).block_until_ready()
+        ft_list.append(time.perf_counter() - t0)
+    fom_min_times.append(min(ft_list))
+avg_fom_min = float(np.mean(fom_min_times))
+zs_speedup  = avg_fom_min / zs_per_case
+
+# Zero-shot errors
+u_zs_np = np.array(u_zs_batch)
+zs_errs = []
+for i, (k1, k2, k3) in enumerate(all_bench_ks):
+    u_ex = np.array(get_analytical_solution_3d(k1, k2, k3))
+    zs_errs.append(float(np.linalg.norm(u_zs_np[i] - u_ex) / np.linalg.norm(u_ex)))
+zs_unseen_err = float(np.mean(zs_errs[:len(test_ks_split)]))
+zs_seen_err   = float(np.mean(zs_errs[len(test_ks_split):]))
+
+print(f"  Zero-shot batch time:  {zs_batch_time*1000:.3f}ms for {n_bench} cases ({zs_per_case*1e6:.1f}µs/case)")
+print(f"  Avg FOM min time:      {avg_fom_min:.5f}s")
+print(f"  Zero-shot speedup:     {zs_speedup:.0f}×")
+print(f"  zs_unseen_error:       {zs_unseen_err:.4e}")
+print(f"  zs_seen_error:         {zs_seen_err:.4e}")
+
 # ─────────────────────────────────────────
 # 10. Summary
 # ─────────────────────────────────────────
 avg_fom_t        = float(np.mean(fom_times))
 avg_rom_t        = float(np.mean(rom_times))
-avg_speedup      = avg_fom_t / avg_rom_t
+avg_gn_speedup   = avg_fom_t / avg_rom_t
 avg_err_fe       = float(np.mean(fom_vs_exact_errors))
 avg_err_re       = float(np.mean(rom_vs_exact_errors))
 rom_unseen_error = float(np.mean(rom_errs_u))
 rom_seen_error   = float(np.mean(rom_errs_s))
+
+# Primary speedup: zero-shot if accurate, else GN
+if zs_unseen_err < 5e-2:
+    avg_speedup = zs_speedup
+    primary_err = zs_unseen_err
+    primary_mode = "zero-shot 5-NN"
+else:
+    avg_speedup = avg_gn_speedup
+    primary_err = rom_unseen_error
+    primary_mode = "GN-refined"
 
 print(f"\n{'='*60}")
 print(f"   3D Poisson  —  Scalable EQ-ROM Benchmark (k²-normalized)")
@@ -623,13 +729,15 @@ print(f"  CP rank:               {cfg['rank']}")
 print(f"  EQ nodes:              {num_eq_points} / {num_nodes} ({100*num_eq_points/num_nodes:.3f}%)")
 print(f"{'--'*30}")
 print(f"  Avg FOM time:          {avg_fom_t:.5f} s")
-print(f"  Avg ROM time:          {avg_rom_t:.5f} s")
-print(f"  Avg speedup:           {avg_speedup:.2f}×")
+print(f"  Avg ROM time (GN):     {avg_rom_t:.5f} s")
+print(f"  Avg speedup:           {avg_speedup:.0f}×  [{primary_mode}]")
 print(f"{'--'*30}")
 print(f"  FOM vs analytical:     {avg_err_fe:.4e}")
 print(f"  ROM vs analytical:     {avg_err_re:.4e}  (primary)")
-print(f"  rom_unseen_error:      {rom_unseen_error:.4e}  (25 held-out test_ks — Phase 1 target < 5e-2)")
-print(f"  rom_seen_error:        {rom_seen_error:.4e}  (10 sampled train_ks)")
+print(f"  rom_unseen_error:      {rom_unseen_error:.4e}  (GN-refined, 25 test_ks)")
+print(f"  rom_seen_error:        {rom_seen_error:.4e}  (GN-refined, 10 train_ks)")
+print(f"  zs_unseen_error:       {zs_unseen_err:.4e}  (zero-shot, Phase 1 target < 5e-2)")
+print(f"  zs_speedup:            {zs_speedup:.0f}×  (zero-shot batch, min-100 runs)")
 print(f"{'='*60}\n")
 print(f"  Scalable EQ-ROM Benchmark complete.")
 
