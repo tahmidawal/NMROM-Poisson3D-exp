@@ -572,7 +572,7 @@ for i, (k1,k2,k3) in enumerate(test_ks):
     rom_vs_exact_errors.append(err_rom_ex)
 
     print(f"  [{i+1:2d}/{n_test}] k=({k1},{k2},{k3}) | "
-          f"FOM {fom_t:.4f}s | ROM {rom_t:.4f}s | "
+          f"FOM {fom_t:.4f}s | ROM {avg_rom_t_batch:.4f}s | "
           f"FOM-exact {err_fom_ex:.3e} | ROM-exact {err_rom_ex:.3e} | GN itr {int(n_iters)}")
 
     if i in plot_at:
