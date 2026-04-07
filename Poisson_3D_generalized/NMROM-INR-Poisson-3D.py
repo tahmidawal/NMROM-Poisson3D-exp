@@ -543,20 +543,32 @@ def run_benchmark(cases, label, exclude_exact=True, use_kz_pred=True):
         F_test   = get_F_3d(k1, k2, k3)
         k2_scale = get_k2_scale(k1, k2, k3)
 
-        t0    = time.perf_counter()
+        # Min timing over 3 runs (removes JIT warmup noise)
+        fom_times_raw = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            _ = full_order_fem_solver_3d(F_test).block_until_ready()
+            fom_times_raw.append(time.perf_counter() - t0)
+        fom_t = min(fom_times_raw)
         u_fom = full_order_fem_solver_3d(F_test).block_until_ready()
-        fom_t = time.perf_counter() - t0
         fom_times_.append(fom_t)
 
         if use_kz_pred and kz_params is not None:
-            lat_init = predict_latent(k1, k2, k3)  # k→z predictor initialization
+            lat_init = predict_latent(k1, k2, k3)
         else:
             lat_init = latent_init_knn(k1, k2, k3, k=5, exclude_exact=exclude_exact)
 
-        t0 = time.perf_counter()
+        rom_times_raw = []
+        for _ in range(3):
+            _lat = (predict_latent(k1, k2, k3) if (use_kz_pred and kz_params is not None)
+                    else latent_init_knn(k1, k2, k3, k=5, exclude_exact=exclude_exact))
+            t0 = time.perf_counter()
+            _lf, _ur, _gr, _ni = fast_eq_latent_poisson_solver(_lat, F_test, k2_scale)
+            jax.block_until_ready(_ur)
+            rom_times_raw.append(time.perf_counter() - t0)
+        rom_t = min(rom_times_raw)
         lat_f, u_rom, gn_res, n_iters = fast_eq_latent_poisson_solver(lat_init, F_test, k2_scale)
         jax.block_until_ready(u_rom)
-        rom_t = time.perf_counter() - t0
         rom_times_.append(rom_t)
 
         u_exact    = get_analytical_solution_3d(k1, k2, k3)
