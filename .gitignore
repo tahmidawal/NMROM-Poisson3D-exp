@@ -1,0 +1,7 @@
+Poisson_3D/results.tsv
+Poisson_3D/*.log
+Poisson_3D/slurm.out
+Poisson_3D/slurm.err
+Poisson_3D/checkpoint.pkl
+Poisson_3D/plots/
+run.log

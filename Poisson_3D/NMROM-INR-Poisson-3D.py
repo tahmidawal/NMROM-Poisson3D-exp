@@ -212,6 +212,8 @@ class ScalableAutoencoder(nn.Module):
 # ─────────────────────────────────────────
 # 3. Load Checkpoint
 # ─────────────────────────────────────────
+assert CKPT_PATH.exists(), f"=== CRASH: checkpoint not found at {CKPT_PATH} — did INR-Autoencoder.py finish? ==="
+assert CKPT_PATH.stat().st_size > 100_000, f"=== CRASH: checkpoint suspiciously small ({CKPT_PATH.stat().st_size} bytes) ==="
 print(f"\n--- Loading checkpoint from {CKPT_PATH} ---")
 with open(CKPT_PATH, 'rb') as f:
     ckpt = pickle.load(f)
@@ -699,4 +701,4 @@ plt.savefig(fpath, dpi=150, bbox_inches='tight')
 plt.close()
 print(f"   Saved: {fpath}")
 
-print("\n=== Scalable EQ-ROM Complete ===")
+print("\n=== NMROM COMPLETE ===")

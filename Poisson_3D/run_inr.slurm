@@ -70,7 +70,8 @@ submit_new_job() {
         step1="echo '=== Step 1: Training Autoencoder ===' && python3 INR-Autoencoder.py"
     fi
     echo ">> No GPU node found — submitting new SLURM job..."
-    sbatch \
+    local jobid
+    jobid=$(sbatch \
         --job-name=INR-Autoencoder-3D \
         --nodes=1 --ntasks=4 \
         --time=02:00:00 \
@@ -81,6 +82,7 @@ submit_new_job() {
         --gres=gpu:a100:1 \
         --output="$SCRIPT_DIR/slurm.out" \
         --error="$SCRIPT_DIR/slurm.err" \
+        --parsable \
         --wrap="
             source /etc/profile.d/z00_lmod.sh 2>/dev/null || source /etc/profile.d/modules.sh 2>/dev/null || true
             module load python/3.10.4 cuda/12.2 cudnn/8.9.7-12.x
@@ -89,8 +91,13 @@ submit_new_job() {
             $step1
             echo '=== Step 2: Training NM-ROM ==='
             python3 NMROM-INR-Poisson-3D.py
-        "
-    echo ">> Watch progress: tail -f $SCRIPT_DIR/training.log"
+        ")
+    echo ">> Submitted SLURM job $jobid — waiting for completion..."
+    # Poll until job finishes
+    while squeue -j "$jobid" -h &>/dev/null; do
+        sleep 15
+    done
+    echo ">> Job $jobid finished."
 }
 
 ssh_to_node() {

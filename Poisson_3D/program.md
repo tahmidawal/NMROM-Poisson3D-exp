@@ -82,18 +82,29 @@ If that job dies, it will automatically submit a new SLURM job instead.
 
 ---
 
+## Detecting completion vs crash
+
+After a run, first check that both stages completed successfully:
+```bash
+grep "=== AE TRAINING COMPLETE ===" training.log   # must exist
+grep "=== NMROM COMPLETE ===" nmrom.log            # must exist
+```
+If either is missing → crash. Run `tail -50 run.log` to read the error.
+
 ## Extracting results
 
 ```bash
 # Primary metrics
-grep "Avg speedup\|ROM vs analytical\|EQ nodes\|Avg FOM\|Avg ROM" nmrom.log
+grep "Avg speedup\|ROM vs analytical\|EQ nodes" nmrom.log
 
 # Autoencoder quality
 grep "Mean train rec\|Mean val rec" training.log
-
-# Check for crashes
-tail -30 run.log
 ```
+
+Parse speedup like: `grep "Avg speedup" nmrom.log` → `Avg speedup:           13.83×`
+Parse error like: `grep "ROM vs analytical" nmrom.log` → `ROM vs analytical:     9.7612e-03`
+Parse AE error like: `grep "Mean train rec" training.log` → `Mean train rec error:   4.04e-03`
+Parse EQ sparsity like: `grep "EQ nodes" nmrom.log` → `EQ nodes:              26999 / 32768 (82.394%)`
 
 ---
 
@@ -168,21 +179,43 @@ git reset --hard HEAD
 
 ---
 
+## Decision rule (tiebreaker)
+
+After extracting metrics, decide using this priority order:
+1. If `rom_error >= 5e-2` → **DISCARD** regardless of speedup (accuracy floor violated)
+2. If `speedup > best_speedup_so_far` → **KEEP** (primary goal achieved)
+3. If `speedup <= best_speedup_so_far` → **DISCARD** (no improvement)
+4. If run crashed (missing success markers) → **DISCARD** as crash
+
+Track `best_speedup_so_far` yourself — it starts at 13.83 (the baseline).
+
+## Failure modes to watch for
+
+- **Missing `=== AE TRAINING COMPLETE ===`**: autoencoder crashed (NaN loss, OOM, import error)
+- **Missing `=== NMROM COMPLETE ===`**: NMROM crashed (checkpoint missing, JAX compile error, numerical issue)
+- **Speedup < 1.0**: ROM slower than FOM — something is very wrong, discard
+- **`rom_error > 0.5`**: wildly inaccurate — likely AE didn't train properly, discard
+- **Run hangs >20 min**: kill with Ctrl+C, treat as crash, discard
+
 ## The experiment loop
 
 LOOP FOREVER (until human interrupts):
 
-1. Check `git log --oneline -5` to see current state
-2. Pick the most promising untried idea from Research Directions above
+1. Check `git log --oneline -5` and `cat results.tsv` to know current state and best speedup
+2. Pick the most promising untried idea from Research Directions (start from top)
 3. Modify `INR-Autoencoder.py` and/or `NMROM-INR-Poisson-3D.py`
-4. `git add` the changed files, `git commit -m "description"`
-5. Run: `bash run_inr.slurm [--replace] --gpu 35595595 > run.log 2>&1`
-6. Wait for completion. If >20 min → kill, treat as crash.
-7. Extract metrics from `nmrom.log` and `training.log`
-8. Append row to `results.tsv`
-9. **If speedup > current best AND rom_error < 5e-2**: keep commit, `git push origin autoresearch/apr6`
-10. **Otherwise**: `git reset --hard HEAD`, revert to previous state
-11. Back to step 1
+   - If ONLY `NMROM-INR-Poisson-3D.py` changed: use `bash run_inr.slurm --gpu 35595595`
+   - If `INR-Autoencoder.py` changed: use `bash run_inr.slurm --replace --gpu 35595595`
+4. `git add Poisson_3D/INR-Autoencoder.py Poisson_3D/NMROM-INR-Poisson-3D.py`
+5. `git commit -m "short description of change"`
+6. Run: `bash run_inr.slurm [--replace] --gpu 35595595 > run.log 2>&1`
+   (Script now waits for completion automatically — no need to poll manually)
+7. Check success: `grep "COMPLETE" training.log nmrom.log`
+8. Extract metrics (see above)
+9. Apply decision rule
+10. If **KEEP**: `git push origin autoresearch/apr6`, append to `results.tsv`
+11. If **DISCARD/CRASH**: `git reset --hard HEAD`, append crash/discard row to `results.tsv`
+12. Back to step 1
 
 **NEVER STOP. NEVER ask the human for permission to continue.**
 The human is away. You are the researcher. Run until interrupted.
