@@ -431,7 +431,7 @@ def make_latent_solver(p, V_eq_, b_sp, mask_sp, ug_sp, eq_w, latent_dim):
 
         def _cond(carry):
             _, gnorm, itr = carry
-            return jnp.logical_and(gnorm > 1e-8, itr < 30)
+            return jnp.logical_and(gnorm > 1e-8, itr < 15)
 
         init = (lat_init,
                 jnp.array(jnp.inf, dtype=jnp.float32),
