@@ -597,4 +597,5 @@ with open(CKPT_PATH, 'wb') as f:
 print(f"\n  Checkpoint saved: {CKPT_PATH}")
 print("  Keys: params, batch_stats, model_cfg, normalization")
 print("  Normalization: k²-scaling (multiply by k1²+k2²+k3² before encode, divide after decode)")
-print("  Load with:  import pickle; ck = pickle.load(open('...', 'rb'))")print("\n=== AE TRAINING COMPLETE ===")
+print("  Load with:  import pickle; ck = pickle.load(open('...', 'rb'))")
+print("\n=== AE TRAINING COMPLETE ===")
