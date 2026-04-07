@@ -1,0 +1,743 @@
+"""
+nmrom_scalable.py
+-----------------
+NM-ROM (Non-linear Manifold Reduced Order Model) for 3D Poisson
+using the ScalableAutoencoder (Conv3D encoder + Separable CP decoder).
+
+Pipeline:
+  1. Load trained checkpoint (params + batch_stats)
+  2. Empirical Quadrature — offline phase
+     - Compute integrand matrices G at training snapshots
+     - NNLS → sparse EQ weights + indices
+     - Precompute V_eq from separable factor matrices (replaces W_sparse)
+  3. LM-GN hyper-reduced online solver
+  4. Benchmark vs FOM + plots
+"""
+
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+import optax
+import jax.scipy.sparse.linalg as jax_linalg
+import numpy as np
+from scipy.optimize import nnls
+import matplotlib.pyplot as plt
+import pickle
+import time
+import sys
+from pathlib import Path
+from typing import Sequence
+
+# ─────────────────────────────────────────
+# 0. Paths & Logging
+# ─────────────────────────────────────────
+SCRIPT_DIR = Path(__file__).parent.resolve()
+CKPT_PATH  = SCRIPT_DIR / 'checkpoint.pkl'
+OUTPUT_DIR = SCRIPT_DIR / 'plots'
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Setup logging to file
+LOG_FILE = SCRIPT_DIR / 'nmrom.log'
+class TeeLogger:
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, 'w')
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+sys.stdout = TeeLogger(LOG_FILE)
+
+# ─────────────────────────────────────────
+# 1. Grid & Physics  (identical to original)
+# ─────────────────────────────────────────
+N         = 32
+num_nodes = N ** 3
+L         = 1.0
+dx        = L / (N - 1)
+
+x_sp = jnp.linspace(0, L, N)
+y_sp = jnp.linspace(0, L, N)
+z_sp = jnp.linspace(0, L, N)
+X, Y, Z = jnp.meshgrid(x_sp, y_sp, z_sp, indexing='ij')
+
+def K_op_3d(u_flat):
+    u   = u_flat.reshape((N, N, N))
+    out = jnp.zeros_like(u)
+    out = out.at[1:-1,1:-1,1:-1].set(
+        (6*u[1:-1,1:-1,1:-1]
+         - u[0:-2,1:-1,1:-1] - u[2:,1:-1,1:-1]
+         - u[1:-1,0:-2,1:-1] - u[1:-1,2:,1:-1]
+         - u[1:-1,1:-1,0:-2] - u[1:-1,1:-1,2:]) / dx**2
+    )
+    out = out.at[0,:,:].set(u[0,:,:])
+    out = out.at[-1,:,:].set(u[-1,:,:])
+    out = out.at[:,0,:].set(u[:,0,:])
+    out = out.at[:,-1,:].set(u[:,-1,:])
+    out = out.at[:,:,0].set(u[:,:,0])
+    out = out.at[:,:,-1].set(u[:,:,-1])
+    return out.flatten()
+
+def get_F_3d(k1, k2, k3):
+    F = jnp.sin(k1*jnp.pi*X) * jnp.sin(k2*jnp.pi*Y) * jnp.sin(k3*jnp.pi*Z) * 10.0
+    F = F.at[0,:,:].set(0.).at[-1,:,:].set(0.)
+    F = F.at[:,0,:].set(0.).at[:,-1,:].set(0.)
+    F = F.at[:,:,0].set(0.).at[:,:,-1].set(0.)
+    return F.flatten()
+
+def get_analytical_solution_3d(k1, k2, k3):
+    c = 10.0 / ((k1**2 + k2**2 + k3**2) * jnp.pi**2)
+    return (c * jnp.sin(k1*jnp.pi*X)
+              * jnp.sin(k2*jnp.pi*Y)
+              * jnp.sin(k3*jnp.pi*Z)).flatten()
+
+def get_k2_scale(k1, k2, k3):
+    """Return normalization factor: k1² + k2² + k3².
+    Analytical solution scales as 1/k², so multiplying by k² normalizes."""
+    return float(k1**2 + k2**2 + k3**2)
+
+def full_order_fem_solver_3d(F_vec, u_guess=None):
+    if u_guess is None:
+        u_guess = jnp.zeros(num_nodes)
+    u, _ = jax_linalg.cg(K_op_3d, F_vec, x0=u_guess, tol=1e-6, maxiter=2000)
+    return u
+
+# Boundary mask
+mask_3d = jnp.ones((N, N, N))
+mask_3d = mask_3d.at[0,:,:].set(0.).at[-1,:,:].set(0.)
+mask_3d = mask_3d.at[:,0,:].set(0.).at[:,-1,:].set(0.)
+mask_3d = mask_3d.at[:,:,0].set(0.).at[:,:,-1].set(0.)
+mask    = mask_3d.flatten()
+u_g     = jnp.zeros(num_nodes)
+
+print(f"3D Domain: {N}³ = {num_nodes:,} nodes")
+print(f"Interior : {int(mask.sum()):,}  |  Boundary: {num_nodes - int(mask.sum()):,}")
+
+# ─────────────────────────────────────────
+# 2. Model Definition  (must match training)
+# ─────────────────────────────────────────
+class AttentionPooling(nn.Module):
+    latent_dim: int
+
+    @nn.compact
+    def __call__(self, feat_map):
+        C      = feat_map.shape[-1]
+        tokens = feat_map.reshape(-1, C)
+        tokens = nn.Dense(self.latent_dim)(tokens)
+        query  = self.param('query', nn.initializers.normal(0.02), (self.latent_dim,))
+        scale  = jnp.sqrt(jnp.float32(self.latent_dim))
+        scores = jnp.einsum('td,d->t', tokens, query) / scale
+        w      = jax.nn.softmax(scores, axis=0)
+        return jnp.einsum('t,td->d', w, tokens)
+
+
+class Conv3DEncoder(nn.Module):
+    latent_dim: int
+    features:   Sequence[int] = (32, 64, 128)
+    pool_size:  int = 4
+
+    @nn.compact
+    def __call__(self, x, training: bool = False):
+        h = x[..., None]
+        for feat in self.features:
+            h = nn.Conv(feat, kernel_size=(3,3,3),
+                        strides=(2,2,2), padding='SAME')(h)
+            h = nn.BatchNorm(use_running_average=not training, momentum=0.9)(h)
+            h = nn.leaky_relu(h, negative_slope=0.2)
+        H, W, D, C = h.shape
+        if H != self.pool_size:
+            h = jax.image.resize(h,
+                                 (self.pool_size, self.pool_size,
+                                  self.pool_size, C),
+                                 method='linear')
+        return AttentionPooling(self.latent_dim)(h)
+
+
+class SeparableDecoder(nn.Module):
+    latent_dim:  int
+    rank:        int = 256
+    grid_size:   int = 32
+    hidden_dims: Sequence[int] = (256, 512)
+
+    def setup(self):
+        self.hidden_layers = [nn.Dense(d) for d in self.hidden_dims]
+        self.to_rank       = nn.Dense(self.rank)
+        init = nn.initializers.normal(0.01)
+        N    = self.grid_size
+        self.W_x         = self.param('W_x',  init, (self.rank, N))
+        self.W_y         = self.param('W_y',  init, (self.rank, N))
+        self.W_z         = self.param('W_z',  init, (self.rank, N))
+        self.bias_scalar = self.param('bias', nn.initializers.zeros, ())
+
+    def _mlp_body(self, z):
+        h = z
+        for layer in self.hidden_layers:
+            h = nn.swish(layer(h))
+        return self.to_rank(h)
+
+    def __call__(self, z):
+        h    = self._mlp_body(z)
+        u_3d = jnp.einsum('r,ri,rj,rk->ijk', h, self.W_x, self.W_y, self.W_z)
+        return u_3d.flatten() + self.bias_scalar
+
+
+class ScalableAutoencoder(nn.Module):
+    latent_dim:    int
+    rank:          int = 256
+    grid_size:     int = 32
+    conv_features: Sequence[int] = (32, 64, 128)
+    hidden_dims:   Sequence[int] = (256, 512)
+
+    def setup(self):
+        self.encoder = Conv3DEncoder(latent_dim=self.latent_dim,
+                                     features=self.conv_features)
+        self.decoder = SeparableDecoder(latent_dim=self.latent_dim,
+                                        rank=self.rank,
+                                        grid_size=self.grid_size,
+                                        hidden_dims=self.hidden_dims)
+
+    def encode(self, u_flat, training=False):
+        u_3d = u_flat.reshape(self.grid_size, self.grid_size, self.grid_size)
+        return self.encoder(u_3d, training=training)
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def __call__(self, u_flat, training=False):
+        return self.decode(self.encode(u_flat, training=training))
+
+# ─────────────────────────────────────────
+# 3. Load Checkpoint
+# ─────────────────────────────────────────
+print(f"\n--- Loading checkpoint from {CKPT_PATH} ---")
+with open(CKPT_PATH, 'rb') as f:
+    ckpt = pickle.load(f)
+
+params      = ckpt['params']
+batch_stats = ckpt['batch_stats']
+cfg         = ckpt['model_cfg']
+k_dim       = cfg['latent_dim']
+kz_params   = ckpt.get('kz_predictor', None)
+
+model = ScalableAutoencoder(**cfg)
+print(f"   Latent dim : {k_dim}")
+print(f"   CP rank    : {cfg['rank']}")
+print(f"   Grid size  : {cfg['grid_size']}")
+print(f"   k→z pred   : {'available' if kz_params is not None else 'not found'}")
+
+# ── k→z predictor wrapper ────────────────────────────────────────────
+def k_predictor_forward(p, k_input):
+    """Forward pass for k→z predictor MLP."""
+    h = jax.nn.swish(k_input @ p['W1'] + p['b1'])
+    h = jax.nn.swish(h @ p['W2'] + p['b2'])
+    return h @ p['W3'] + p['b3']
+
+def predict_latent(k1, k2, k3):
+    """Predict latent code z from (k1, k2, k3) using trained k→z predictor."""
+    if kz_params is None:
+        return jnp.zeros(k_dim)
+    k_input = jnp.array([k1/5.0, k2/5.0, k3/5.0])
+    return k_predictor_forward(kz_params, k_input)
+
+# ── Convenience wrappers (always eval mode for ROM) ──────────────────
+def encode(u_flat):
+    return model.apply(
+        {'params': params, 'batch_stats': batch_stats},
+        u_flat, training=False, method=model.encode
+    )
+
+def decode(z):
+    return model.apply(
+        {'params': params, 'batch_stats': batch_stats},
+        z, method=model.decode
+    )
+
+def constrained_decode(z):
+    """ũ(z) = mask ⊙ D(z) + u_g  — hard Dirichlet BCs."""
+    return mask * decode(z) + u_g
+
+# ─────────────────────────────────────────
+# 4. Rebuild Training Snapshots (Analytical + k²-Normalization)
+#    (needed for EQ integrand computation)
+# ─────────────────────────────────────────
+print("\n--- Rebuilding training snapshots (Analytical, k²-normalized) ---")
+import random
+random.seed(42)
+all_ks = [(k1, k2, k3)
+          for k1 in range(1, 6)
+          for k2 in range(1, 6)
+          for k3 in range(1, 6)]  # 125 total
+random.shuffle(all_ks)
+n_test        = 25
+test_ks_split = all_ks[:n_test]   # 25 unseen — ROM benchmark only
+train_ks      = all_ks[n_test:]   # 100 training combinations
+
+U_train_list = []
+scale_factors_train = []
+for i, (k1,k2,k3) in enumerate(train_ks):  # 100 training snapshots
+    u = get_analytical_solution_3d(k1, k2, k3)
+    k2_scale = get_k2_scale(k1, k2, k3)
+    u_normalized = u * k2_scale  # normalize by k²
+    U_train_list.append(u_normalized)
+    scale_factors_train.append(k2_scale)
+    if (i+1) % 25 == 0:
+        print(f"   {i+1}/{len(train_ks)} snapshots")
+
+U_train = jnp.stack(U_train_list)  # (100, num_nodes)
+scale_factors_train = jnp.array(scale_factors_train)
+print(f"   Shape: {U_train.shape}")
+print(f"   Scale factors range: [{scale_factors_train.min():.0f}, {scale_factors_train.max():.0f}]")
+print(f"   Train cases: {len(train_ks)}, Test cases (held-out): {len(test_ks_split)}")
+
+# ─────────────────────────────────────────────────────────────────────
+# 5. Empirical Quadrature — Offline Phase
+#
+# Integrand matrix per snapshot:
+#   G[j, i] = (∂ũ/∂z_j)(i) · R(i)
+#
+# where R(i) = [Kũ - F](i)  and  J_D = ∂(constrained_decode)/∂z
+#
+# Stack all snapshots → NNLS → sparse weights w ≥ 0
+# ─────────────────────────────────────────────────────────────────────
+print("\n--- Empirical Quadrature: Offline Phase ---")
+
+@jax.jit
+def get_integrand(lat_val, F_val_normalized):
+    """Returns G ∈ R^{k_dim × num_nodes}
+    Note: F_val_normalized should be F * k² to match normalized solution space."""
+    R_full = K_op_3d(constrained_decode(lat_val)) - F_val_normalized
+    J_D    = jax.jacfwd(constrained_decode)(lat_val)   # (num_nodes, k_dim)
+    return J_D.T * R_full[None, :]                     # (k_dim, num_nodes)
+
+G_list = []
+print("   Computing integrand matrices...")
+for i, (k1,k2,k3) in enumerate(train_ks):  # 100 training snapshots only
+    lat_i = encode(U_train[i])
+    k2_scale = get_k2_scale(k1, k2, k3)
+    F_normalized = get_F_3d(k1, k2, k3) * k2_scale  # scale F by k²
+    G_list.append(get_integrand(lat_i, F_normalized))
+    if (i+1) % 25 == 0:
+        print(f"   {i+1}/{len(train_ks)} integrands done")
+
+G_train = jnp.concatenate(G_list, axis=0)              # (100*k_dim, num_nodes) on GPU
+G_train = G_train * mask[None, :]                       # zero out boundary cols (GPU)
+b_jax   = jnp.sum(G_train, axis=1)                     # (m,) on GPU
+G_jax   = G_train                                       # already on GPU
+
+print("   Running NNLS (JAX GPU projected gradient)...")
+
+@jax.jit
+def nnls_step(w, lr=1e-3):
+    grad = G_jax.T @ (G_jax @ w - b_jax)   # (n,) gradient of 0.5*||Gw-b||²
+    return jnp.maximum(0.0, w - lr * grad)  # projected gradient step
+
+w_jax = jnp.zeros(G_jax.shape[1])
+# Adaptive LR via Lipschitz constant estimate: L = ||G^T G||_max_col ≈ max col norm of G^TG
+# Use lr = 1 / ||G||_F² as safe upper bound
+lr = float(1.0 / (jnp.linalg.norm(G_jax, 'fro') ** 2 + 1e-10))
+for _it in range(5000):
+    w_jax = nnls_step(w_jax, lr)
+w_eq = np.array(w_jax)
+eq_indices     = np.where(w_eq > 1e-10)[0]
+eq_weights_np  = w_eq[eq_indices]
+
+eq_indices_jnp  = jnp.array(eq_indices)
+eq_weights_jnp  = jnp.array(eq_weights_np)
+num_eq_points   = len(eq_indices)
+
+print(f"   Nodes reduced: {num_nodes:,} → {num_eq_points}  "
+      f"({100*num_eq_points/num_nodes:.3f}%)")
+
+# ─────────────────────────────────────────────────────────────────────
+# 6. Precompute V_eq — Separable Factor Product at EQ Stencil Indices
+#
+# Original dense approach:
+#   W_sparse = W_final[:, gather_indices_flat]   (rank × num_eq*7)
+#
+# Separable approach — exactly equivalent, just computed differently:
+#   V_eq[:, p] = W_x[:, ix_p] ⊙ W_y[:, iy_p] ⊙ W_z[:, iz_p]
+#
+# Same shape. Same matmul in the hot path. h @ V_eq is identical.
+# ─────────────────────────────────────────────────────────────────────
+print("\n--- Precomputing V_eq (separable sparse factors) ---")
+
+N2              = N * N
+stencil_offsets = jnp.array([0, -1, 1, -N, N, -N2, N2])  # 7-point
+gather_indices  = (eq_indices_jnp[:, None]
+                   + stencil_offsets[None, :]).flatten()   # (num_eq*7,)
+
+ix = gather_indices // N2
+iy = (gather_indices // N) % N
+iz = gather_indices % N
+
+# Pull factor matrices from checkpoint
+W_x = params['decoder']['W_x']   # (rank, N)
+W_y = params['decoder']['W_y']
+W_z = params['decoder']['W_z']
+
+# Element-wise product → (rank, num_eq*7)
+V_eq     = W_x[:, ix] * W_y[:, iy] * W_z[:, iz]
+b_scalar = params['decoder']['bias']
+b_sparse = jnp.full(gather_indices.shape, b_scalar)
+
+mask_sparse = mask[gather_indices]
+u_g_sparse  = u_g[gather_indices]
+
+print(f"   V_eq shape : {V_eq.shape}   (rank × num_eq*7)")
+print(f"   EQ points  : {num_eq_points}")
+
+# ─────────────────────────────────────────────────────────────────────
+# 7. Hyper-Reduced Online Solver
+#
+# _res_fn structure is IDENTICAL to original make_latent_solver.
+# Only difference: MLP body uses the new decoder param names,
+# and final matmul uses V_eq instead of W_sparse.
+# ─────────────────────────────────────────────────────────────────────
+print("\n--- Building hyper-reduced solver ---")
+
+def make_latent_solver(p, V_eq_, b_sp, mask_sp, ug_sp, eq_w, latent_dim):
+    """Matrix-free Gauss-Newton solver using VJP+JVP+CG (like the working 2D example).
+
+    Instead of materializing the full (m × k) Jacobian and doing a direct solve,
+    we use:
+      - jax.vjp  to compute the gradient J^T W R (cheap reverse pass)
+      - jax.jvp  to compute J δz              (cheap forward pass)
+      - jax_linalg.cg to solve (J^T W J + λI) δz = -J^T W R iteratively
+
+    This is numerically robust when the initialization is far from the solution
+    because CG handles ill-conditioned systems gracefully.
+    """
+    dec = p['decoder']
+    W0, b0 = dec['hidden_layers_0']['kernel'], dec['hidden_layers_0']['bias']
+    W1, b1 = dec['hidden_layers_1']['kernel'], dec['hidden_layers_1']['bias']
+    Wr, br = dec['to_rank']['kernel'],         dec['to_rank']['bias']
+
+    def _mlp_body(lat):
+        h = nn.swish(lat @ W0 + b0)
+        h = nn.swish(h   @ W1 + b1)
+        return h @ Wr + br
+
+    def _res_fn(lat, F_eq):
+        h = _mlp_body(lat)
+        u_stencil = (mask_sp * (h @ V_eq_ + b_sp) + ug_sp).reshape((-1, 7))
+        R = (6 * u_stencil[:, 0]
+             - u_stencil[:, 1] - u_stencil[:, 2]
+             - u_stencil[:, 3] - u_stencil[:, 4]
+             - u_stencil[:, 5] - u_stencil[:, 6]) / dx**2 - F_eq
+        return R
+
+    def _gn_step(lat, F_eq):
+        """One matrix-free LM-GN step via VJP+JVP+CG."""
+        R, vjp_fn = jax.vjp(lambda l: _res_fn(l, F_eq), lat)
+
+        # Weighted gradient: J^T W R
+        r_red = vjp_fn(eq_w * R)[0]
+
+        # Levenberg-Marquardt damping: λ = 1e-3 * ||r_red|| / k_dim
+        lam = jnp.maximum(1e-3 * jnp.linalg.norm(r_red) / latent_dim, 1e-8)
+
+        # Matrix-free (J^T W J + λI) operator for CG
+        def hv_op(dz):
+            _, jvp_R = jax.jvp(lambda l: _res_fn(l, F_eq), (lat,), (dz,))
+            return vjp_fn(eq_w * jvp_R)[0] + lam * dz
+
+        dz, _ = jax_linalg.cg(hv_op, -r_red, tol=1e-5, maxiter=latent_dim * 4)
+
+        # Armijo backtracking (5 levels)
+        f0 = jnp.dot(eq_w * R, R)
+        def _f(alpha):
+            Rt = _res_fn(lat + alpha * dz, F_eq)
+            return jnp.dot(eq_w * Rt, Rt)
+        f1, f2, f3, f4, f5 = _f(1.), _f(.5), _f(.25), _f(.125), _f(.0625)
+        step = jnp.where(f1 < f0, 1.0,
+               jnp.where(f2 < f0, 0.5,
+               jnp.where(f3 < f0, 0.25,
+               jnp.where(f4 < f0, 0.125,
+               jnp.where(f5 < f0, 0.0625, 0.0)))))
+
+        return lat + step * dz, jnp.linalg.norm(r_red)
+
+    def solve(lat_init, F_eq, max_iters=30, tol=1e-6):
+        """Iterative GN solve — Python loop (not jax.lax.while_loop) so CG can run inside."""
+        lat = lat_init
+        n_iters = 0
+        for i in range(max_iters):
+            lat, gnorm = _gn_step(lat, F_eq)
+            n_iters = i + 1
+            if float(gnorm) < tol:
+                break
+        return lat, gnorm, n_iters
+
+    return solve
+
+
+latent_solve = make_latent_solver(
+    params, V_eq, b_sparse, mask_sparse, u_g_sparse,
+    eq_weights_jnp, k_dim
+)
+
+def fast_eq_latent_poisson_solver(lat_init, F_vec, k2_scale):
+    """Hyper-reduced solve → full reconstructed field."""
+    F_normalized = F_vec * k2_scale
+    F_eq  = F_normalized[eq_indices_jnp]
+    lat_f, res_f, n_iters = latent_solve(lat_init, F_eq)
+    u_normalized = constrained_decode(lat_f)
+    u_final = u_normalized / k2_scale
+    return lat_f, u_final, res_f, n_iters
+
+# ─────────────────────────────────────────
+# 8. Warm-up
+# ─────────────────────────────────────────
+print("\n--- Precomputing encoded training latent codes for 5-NN init ---")
+Z_train_encoded = [encode(U_train[i]) for i in range(len(train_ks))]
+print(f"   Encoded {len(Z_train_encoded)} training latent codes.")
+
+def latent_init_5nn(k1, k2, k3):
+    """5-NN init from ENCODED training snapshots — always on the learned manifold.
+    This is the initialization strategy from the working 2D example: start from
+    a real encoded snapshot rather than a potentially off-manifold MLP prediction.
+    """
+    dists    = [(k1-a)**2 + (k2-b)**2 + (k3-c)**2 for a,b,c in train_ks]
+    sorted_i = np.argsort(dists)
+    nn_idx   = sorted_i[:5]
+    nn_dists = [np.sqrt(dists[j]) + 1e-12 for j in nn_idx]
+    weights  = np.array([1.0 / d for d in nn_dists])
+    weights /= weights.sum()
+    lat = sum(w * Z_train_encoded[j] for w, j in zip(weights, nn_idx))
+    return lat
+
+print("\n--- Warming up JAX compilers ---")
+_F_wm  = get_F_3d(2, 2, 2)
+_k2_wm = get_k2_scale(2, 2, 2)
+full_order_fem_solver_3d(_F_wm).block_until_ready()
+_lat_wm = latent_init_5nn(2, 2, 2)
+for _ in range(3):
+    _, _u_wm, _, _ = fast_eq_latent_poisson_solver(_lat_wm, _F_wm, _k2_wm)
+    jax.block_until_ready(_u_wm)
+print("   Warm-up complete.\n")
+
+# ─────────────────────────────────────────
+# 9. Benchmark
+# ─────────────────────────────────────────
+print("--- Benchmark ---")
+
+# rom_unseen_error: 25 held-out test_ks — never seen during AE training or EQ offline
+# rom_seen_error:   10 random samples from train_ks (sanity check)
+import random as _random
+_rng = _random.Random(99)
+seen_sample_ks = _rng.sample(train_ks, min(10, len(train_ks)))
+
+def run_benchmark(cases, label):
+    fom_times_, rom_times_ = [], []
+    fom_errs_, rom_errs_   = [], []
+    stored_                = {}
+    n = len(cases)
+    for i, (k1, k2, k3) in enumerate(cases):
+        F_test   = get_F_3d(k1, k2, k3)
+        k2_scale = get_k2_scale(k1, k2, k3)
+
+        t0    = time.perf_counter()
+        u_fom = full_order_fem_solver_3d(F_test).block_until_ready()
+        fom_t = time.perf_counter() - t0
+        fom_times_.append(fom_t)
+
+        # 5-NN from encoded training snapshots (always on-manifold init)
+        lat_init = latent_init_5nn(k1, k2, k3)
+
+        t0 = time.perf_counter()
+        lat_f, u_rom, gn_res, n_iters = fast_eq_latent_poisson_solver(lat_init, F_test, k2_scale)
+        jax.block_until_ready(u_rom)
+        rom_t = time.perf_counter() - t0
+        rom_times_.append(rom_t)
+
+        u_exact    = get_analytical_solution_3d(k1, k2, k3)
+        norm_exact = float(jnp.linalg.norm(u_exact))
+        err_fom    = float(jnp.linalg.norm(u_fom - u_exact) / norm_exact)
+        err_rom    = float(jnp.linalg.norm(u_rom - u_exact) / norm_exact)
+        fom_errs_.append(err_fom)
+        rom_errs_.append(err_rom)
+
+        print(f"  [{i+1:2d}/{n}] k=({k1},{k2},{k3}) | "
+              f"FOM {fom_t:.4f}s | ROM {rom_t:.4f}s | "
+              f"FOM-exact {err_fom:.3e} | ROM-exact {err_rom:.3e} | GN itr {int(n_iters)}")
+        stored_[i] = dict(u_fom=np.asarray(u_fom), u_rom=np.asarray(u_rom),
+                          u_exact=np.asarray(u_exact), k=(k1,k2,k3))
+    return fom_times_, rom_times_, fom_errs_, rom_errs_, stored_
+
+# Unseen test cases (ground-truth generalization metric)
+print(f"\n=== UNSEEN TEST CASES ({len(test_ks_split)} cases — held out from AE training & EQ) ===")
+fom_times_u, rom_times_u, fom_errs_u, rom_errs_u, stored_u = run_benchmark(test_ks_split, "unseen")
+
+# Seen training cases (sanity check)
+print(f"\n=== SEEN TRAINING CASES ({len(seen_sample_ks)} sampled from train_ks) ===")
+fom_times_s, rom_times_s, fom_errs_s, rom_errs_s, stored_s = run_benchmark(seen_sample_ks, "seen")
+
+# Combined for plotting
+fom_times           = fom_times_u + fom_times_s
+rom_times           = rom_times_u + rom_times_s
+fom_vs_exact_errors = fom_errs_u  + fom_errs_s
+rom_vs_exact_errors = rom_errs_u  + rom_errs_s
+test_ks  = test_ks_split + seen_sample_ks
+stored   = {**stored_u, **{k + len(test_ks_split): v for k, v in stored_s.items()}}
+n_test   = len(test_ks)
+
+# ─────────────────────────────────────────
+# 10. Summary
+# ─────────────────────────────────────────
+avg_fom_t        = float(np.mean(fom_times))
+avg_rom_t        = float(np.mean(rom_times))
+avg_speedup      = avg_fom_t / avg_rom_t
+avg_err_fe       = float(np.mean(fom_vs_exact_errors))
+avg_err_re       = float(np.mean(rom_vs_exact_errors))
+rom_unseen_error = float(np.mean(rom_errs_u))
+rom_seen_error   = float(np.mean(rom_errs_s))
+
+print(f"\n{'='*60}")
+print(f"   3D Poisson  —  Scalable EQ-ROM Benchmark (k²-normalized)")
+print(f"{'='*60}")
+print(f"  Grid:                  {N}³ = {num_nodes:,} DOF")
+print(f"  Latent dim:            {k_dim}")
+print(f"  CP rank:               {cfg['rank']}")
+print(f"  EQ nodes:              {num_eq_points} / {num_nodes} ({100*num_eq_points/num_nodes:.3f}%)")
+print(f"{'--'*30}")
+print(f"  Avg FOM time:          {avg_fom_t:.5f} s")
+print(f"  Avg ROM time:          {avg_rom_t:.5f} s")
+print(f"  Avg speedup:           {avg_speedup:.2f}×")
+print(f"{'--'*30}")
+print(f"  FOM vs analytical:     {avg_err_fe:.4e}")
+print(f"  ROM vs analytical:     {avg_err_re:.4e}  (primary)")
+print(f"  rom_unseen_error:      {rom_unseen_error:.4e}  (25 held-out test_ks — target < 5e-2)")
+print(f"  rom_seen_error:        {rom_seen_error:.4e}  (10 sampled train_ks)")
+print(f"{'='*60}\n")
+print(f"  Scalable EQ-ROM Benchmark complete.")
+
+# 11. Plots
+# ─────────────────────────────────────────
+test_labels = [f"({k[0]},{k[1]},{k[2]})" for k in test_ks]
+x_pos       = np.arange(len(test_ks))
+
+# ── Error bar chart ──────────────────────
+fig, ax = plt.subplots(figsize=(13, 5))
+ax.bar(x_pos - 0.2, rom_vs_exact_errors, width=0.4,
+       color='#1f77b4', label='ROM vs Analytical (primary)')
+ax.bar(x_pos + 0.2, fom_vs_exact_errors, width=0.4,
+       color='#2ca02c', alpha=0.7, label='FOM vs Analytical')
+ax.set_title('Scalable EQ-ROM — Relative $L_2$ Error vs Analytical', fontsize=13)
+ax.set_xlabel('$(k_1, k_2, k_3)$'); ax.set_ylabel('Relative $L_2$ Error')
+ax.set_xticks(x_pos); ax.set_xticklabels(test_labels, rotation=45, ha='right')
+ax.set_yscale('log'); ax.legend()
+ax.grid(True, which='both', ls='--', alpha=0.5, axis='y')
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / 'benchmark_error.png', dpi=150)
+plt.close()
+print(f"Saved: {OUTPUT_DIR / 'benchmark_error.png'}")
+
+# ── Timing bar chart ─────────────────────
+fig, ax = plt.subplots(figsize=(13, 5))
+ax.bar(x_pos - 0.2, fom_times, width=0.4, color='#d62728', label='FOM (CG)')
+ax.bar(x_pos + 0.2, rom_times, width=0.4, color='#1f77b4', label='EQ-ROM')
+ax.axhline(avg_fom_t, color='#d62728', ls=':', alpha=0.7,
+           label=f'FOM avg ({avg_fom_t:.4f}s)')
+ax.axhline(avg_rom_t, color='#1f77b4', ls=':', alpha=0.7,
+           label=f'ROM avg ({avg_rom_t:.4f}s)')
+ax.set_title(f'Scalable EQ-ROM — Solve Time  (avg speedup {avg_speedup:.1f}×)', fontsize=13)
+ax.set_xlabel('$(k_1, k_2, k_3)$'); ax.set_ylabel('Time (s)')
+ax.set_xticks(x_pos); ax.set_xticklabels(test_labels, rotation=45, ha='right')
+ax.legend(); ax.grid(True, axis='y', ls='--', alpha=0.5)
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / 'benchmark_time.png', dpi=150)
+plt.close()
+print(f"Saved: {OUTPUT_DIR / 'benchmark_time.png'}")
+
+# ── Speedup chart ────────────────────────
+speedups = [f / r for f, r in zip(fom_times, rom_times)]
+fig, ax  = plt.subplots(figsize=(13, 4))
+bars     = ax.bar(x_pos, speedups, width=0.6, color='#9467bd',
+                  alpha=0.85, edgecolor='black')
+ax.axhline(1.0,         color='red',    ls='--', lw=1.5, label='Parity (1×)')
+ax.axhline(avg_speedup, color='orange', ls='--', lw=1.5,
+           label=f'Average = {avg_speedup:.1f}×')
+for bar, sp in zip(bars, speedups):
+    ax.text(bar.get_x() + bar.get_width()/2,
+            bar.get_height() + 0.05, f'{sp:.1f}×',
+            ha='center', va='bottom', fontsize=9)
+ax.set_title('Scalable EQ-ROM — Per-test Speedup', fontsize=13)
+ax.set_xlabel('$(k_1, k_2, k_3)$'); ax.set_ylabel('Speedup Factor')
+ax.set_xticks(x_pos); ax.set_xticklabels(test_labels, rotation=45, ha='right')
+ax.set_ylim(0, max(speedups) * 1.2); ax.legend()
+ax.grid(True, axis='y', ls='--', alpha=0.5)
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / 'benchmark_speedup.png', dpi=150)
+plt.close()
+print(f"Saved: {OUTPUT_DIR / 'benchmark_speedup.png'}")
+
+# ── Combined midplane slices (all 14 tests) ──────────────────────
+print("\n--- Combined midplane slice plot (all 14 tests) ---")
+mid = N // 2
+
+# 14 rows (one per test), 4 columns: FOM, ROM, Analytical, |ROM-FOM|
+fig, axes = plt.subplots(n_test, 4, figsize=(16, 3 * n_test))
+
+for idx in sorted(stored):
+    s        = stored[idx]
+    k1,k2,k3 = s['k']
+
+    u_fom_3d = s['u_fom'].reshape(N, N, N)
+    u_rom_3d = s['u_rom'].reshape(N, N, N)
+    u_ex_3d  = s['u_exact'].reshape(N, N, N)
+
+    # Use z-midplane slice
+    sl_fom = u_fom_3d[:, :, mid]
+    sl_rom = u_rom_3d[:, :, mid]
+    sl_ex  = u_ex_3d[:, :, mid]
+
+    vmin = min(sl_fom.min(), sl_rom.min(), sl_ex.min())
+    vmax = max(sl_fom.max(), sl_rom.max(), sl_ex.max())
+    kw   = dict(origin='lower', aspect='auto', cmap='viridis',
+                vmin=vmin, vmax=vmax, extent=[0, L, 0, L])
+
+    # FOM
+    im0 = axes[idx, 0].imshow(sl_fom.T, **kw)
+    axes[idx, 0].set_ylabel(f'k=({k1},{k2},{k3})', fontsize=10, fontweight='bold')
+    if idx == 0:
+        axes[idx, 0].set_title('FOM', fontsize=12)
+
+    # ROM
+    im1 = axes[idx, 1].imshow(sl_rom.T, **kw)
+    if idx == 0:
+        axes[idx, 1].set_title('EQ-ROM', fontsize=12)
+
+    # Analytical
+    im2 = axes[idx, 2].imshow(sl_ex.T, **kw)
+    if idx == 0:
+        axes[idx, 2].set_title('Analytical', fontsize=12)
+
+    # Error |ROM - Analytical|
+    err    = np.abs(sl_rom - sl_ex)
+    im_err = axes[idx, 3].imshow(err.T, origin='lower', aspect='auto',
+                                 cmap='hot', extent=[0, L, 0, L])
+    if idx == 0:
+        axes[idx, 3].set_title('|ROM - Analytical|', fontsize=12)
+
+    # Add colorbars on the right side
+    plt.colorbar(im2, ax=axes[idx, 2], shrink=0.8, pad=0.02)
+    plt.colorbar(im_err, ax=axes[idx, 3], shrink=0.8, pad=0.02)
+
+    # Remove tick labels for cleaner look (except bottom row)
+    for col in range(4):
+        if idx < n_test - 1:
+            axes[idx, col].set_xticklabels([])
+        axes[idx, col].set_yticklabels([])
+
+fig.suptitle('Scalable EQ-ROM — All Test Cases (z-midplane slices)',
+             fontsize=16, fontweight='bold', y=1.0)
+plt.tight_layout()
+fpath = OUTPUT_DIR / 'combined_slices_all.png'
+plt.savefig(fpath, dpi=150, bbox_inches='tight')
+plt.close()
+print(f"   Saved: {fpath}")
+
+print("\n=== Scalable EQ-ROM Complete ===")
