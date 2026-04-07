@@ -220,11 +220,27 @@ params      = ckpt['params']
 batch_stats = ckpt['batch_stats']
 cfg         = ckpt['model_cfg']
 k_dim       = cfg['latent_dim']
+kz_params   = ckpt.get('kz_predictor', None)
 
 model = ScalableAutoencoder(**cfg)
 print(f"   Latent dim : {k_dim}")
 print(f"   CP rank    : {cfg['rank']}")
 print(f"   Grid size  : {cfg['grid_size']}")
+print(f"   k→z pred   : {'available' if kz_params is not None else 'not found'}")
+
+# ── k→z predictor wrapper ────────────────────────────────────────────
+def k_predictor_forward(p, k_input):
+    """Forward pass for k→z predictor MLP."""
+    h = jax.nn.swish(k_input @ p['W1'] + p['b1'])
+    h = jax.nn.swish(h @ p['W2'] + p['b2'])
+    return h @ p['W3'] + p['b3']
+
+def predict_latent(k1, k2, k3):
+    """Predict latent code z from (k1, k2, k3) using trained k→z predictor."""
+    if kz_params is None:
+        return jnp.zeros(k_dim)
+    k_input = jnp.array([k1/5.0, k2/5.0, k3/5.0])
+    return k_predictor_forward(kz_params, k_input)
 
 # ── Convenience wrappers (always eval mode for ROM) ──────────────────
 def encode(u_flat):
@@ -480,7 +496,7 @@ print("\n--- Warming up JAX compilers ---")
 _F_wm   = get_F_3d(2, 2, 2)
 _k2_wm  = get_k2_scale(2, 2, 2)
 full_order_fem_solver_3d(_F_wm).block_until_ready()
-_lat_wm = encode(U_train[0])
+_lat_wm = predict_latent(2, 2, 2) if kz_params is not None else encode(U_train[0])
 for _ in range(2):
     _, _u_wm, _, _ = fast_eq_latent_poisson_solver(_lat_wm, _F_wm, _k2_wm)
 jax.block_until_ready(_u_wm)
@@ -518,7 +534,7 @@ def latent_init_knn(k1, k2, k3, k=5, exclude_exact=True):
     lat      = sum(w * encode(U_train[j]) for w, j in zip(weights, nn_idx))
     return lat / w_sum
 
-def run_benchmark(cases, label, exclude_exact=True):
+def run_benchmark(cases, label, exclude_exact=True, use_kz_pred=True):
     fom_times_, rom_times_ = [], []
     fom_errs_, rom_errs_   = [], []
     stored_                = {}
@@ -532,7 +548,10 @@ def run_benchmark(cases, label, exclude_exact=True):
         fom_t = time.perf_counter() - t0
         fom_times_.append(fom_t)
 
-        lat_init = latent_init_knn(k1, k2, k3, k=5, exclude_exact=exclude_exact)
+        if use_kz_pred and kz_params is not None:
+            lat_init = predict_latent(k1, k2, k3)  # k→z predictor initialization
+        else:
+            lat_init = latent_init_knn(k1, k2, k3, k=5, exclude_exact=exclude_exact)
 
         t0 = time.perf_counter()
         lat_f, u_rom, gn_res, n_iters = fast_eq_latent_poisson_solver(lat_init, F_test, k2_scale)
@@ -554,13 +573,14 @@ def run_benchmark(cases, label, exclude_exact=True):
                           u_exact=np.asarray(u_exact), k=(k1,k2,k3))
     return fom_times_, rom_times_, fom_errs_, rom_errs_, stored_
 
-# rom_unseen_error: test_ks_split cases with 5-NN init (excluding exact match → tests GN convergence)
-print(f"\n=== TEST BENCHMARK ({len(test_ks_split)} cases from test_ks_split, 5-NN init excl. exact) ===")
-fom_times_u, rom_times_u, fom_errs_u, rom_errs_u, stored_u = run_benchmark(test_ks_split, "test", exclude_exact=True)
+# rom_unseen_error: test_ks_split cases with k→z predictor initialization
+init_desc = "k→z pred" if kz_params is not None else "5-NN excl. exact"
+print(f"\n=== TEST BENCHMARK ({len(test_ks_split)} cases from test_ks_split, {init_desc} init) ===")
+fom_times_u, rom_times_u, fom_errs_u, rom_errs_u, stored_u = run_benchmark(test_ks_split, "test", use_kz_pred=True)
 
-# rom_seen_error: seen cases with exact-match allowed (diagnostic for manifold quality)
-print(f"\n=== SEEN TRAINING CASES ({len(seen_sample_ks)} cases, 5-NN incl. exact) ===")
-fom_times_s, rom_times_s, fom_errs_s, rom_errs_s, stored_s = run_benchmark(seen_sample_ks, "seen", exclude_exact=False)
+# rom_seen_error: seen cases with k→z predictor
+print(f"\n=== SEEN TRAINING CASES ({len(seen_sample_ks)} cases, {init_desc} init) ===")
+fom_times_s, rom_times_s, fom_errs_s, rom_errs_s, stored_s = run_benchmark(seen_sample_ks, "seen", use_kz_pred=True)
 
 # Combined for plotting
 fom_times = fom_times_u + fom_times_s

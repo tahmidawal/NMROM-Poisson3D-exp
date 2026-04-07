@@ -606,8 +606,77 @@ print(f"  Mean test rec error:    {np.mean(test_errs):.4e}  (test_ks -- in train
 print(f"  Plots saved to:         {OUT}/")
 print(f"{'='*55}")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 15. Train k→z predictor: small MLP that maps (k1,k2,k3) → latent z
+#     Gives good initialization for GN solver without needing FOM solution
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n── Training k→z Predictor ────────────────────────────")
+
+# Encode all training snapshots to get target latent codes
+print("  Encoding all training snapshots...")
+Z_train = []
+for i, (k1, k2, k3) in enumerate(train_ks):
+    z_i = model.apply(
+        {'params': params, 'batch_stats': batch_stats},
+        U_train[i], training=False, method=model.encode
+    )
+    Z_train.append(z_i)
+Z_train = jnp.stack(Z_train)  # (125, k_dim)
+
+# Input features: normalized k values
+K_train = jnp.array([[k1/5.0, k2/5.0, k3/5.0] for k1, k2, k3 in train_ks])  # (125, 3)
+
+# Simple MLP: 3 → 64 → 128 → k_dim
+import optax as _optax
+
+def k_predictor_init(key, input_dim=3, hidden=64, output_dim=k_dim):
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+    W1 = jax.random.normal(k1, (input_dim, hidden)) * 0.1
+    b1 = jnp.zeros(hidden)
+    W2 = jax.random.normal(k2, (hidden, hidden)) * 0.1
+    b2 = jnp.zeros(hidden)
+    W3 = jax.random.normal(k3, (hidden, output_dim)) * 0.01
+    b3 = jnp.zeros(output_dim)
+    return {'W1': W1, 'b1': b1, 'W2': W2, 'b2': b2, 'W3': W3, 'b3': b3}
+
+def k_predictor_forward(p, k_input):
+    h = jax.nn.swish(k_input @ p['W1'] + p['b1'])
+    h = jax.nn.swish(h @ p['W2'] + p['b2'])
+    return h @ p['W3'] + p['b3']
+
+@jax.jit
+def kz_loss(p, K, Z):
+    Z_pred = jax.vmap(lambda k: k_predictor_forward(p, k))(K)
+    return jnp.mean((Z_pred - Z) ** 2)
+
+kz_key = jax.random.PRNGKey(99)
+kz_params = k_predictor_init(kz_key)
+kz_tx = optax.adam(1e-3)
+kz_opt_state = kz_tx.init(kz_params)
+
+# Note: kz_tx captured in closure, not passed as arg (avoids JAX JIT issue with functions)
+@jax.jit
+def kz_step(p, opt_state, K, Z):
+    loss, grads = jax.value_and_grad(kz_loss)(p, K, Z)
+    updates, new_opt_state = kz_tx.update(grads, opt_state, p)
+    new_p = optax.apply_updates(p, updates)
+    return new_p, new_opt_state, loss
+
+KZ_EPOCHS = 5000
+for ep in range(KZ_EPOCHS + 1):
+    kz_params, kz_opt_state, kz_loss_val = kz_step(kz_params, kz_opt_state, K_train, Z_train)
+    if ep % 1000 == 0:
+        print(f"  k→z epoch {ep:5d} | loss {float(kz_loss_val):.4e}")
+
+# Evaluate predictor
+Z_pred_all = jax.vmap(lambda k: k_predictor_forward(kz_params, k))(K_train)
+kz_errs = [float(jnp.linalg.norm(Z_pred_all[i] - Z_train[i]) / (jnp.linalg.norm(Z_train[i]) + 1e-8))
+           for i in range(len(train_ks))]
+print(f"  Mean k→z prediction error: {np.mean(kz_errs):.4e}")
+print(f"  k→z predictor trained: (k1,k2,k3)/5 → latent z")
+
 # ─────────────────────────────────────────
-# 15. Export model state for downstream use (EQ phase)
+# 16. Export model state for downstream use (EQ phase)
 # ─────────────────────────────────────────
 import pickle
 ckpt = {
@@ -623,12 +692,13 @@ ckpt = {
     'normalization': {
         'type': 'k2_scale',
         'description': 'Multiply input by k1²+k2²+k3² before encoding, divide output after decoding',
-    }
+    },
+    'kz_predictor': kz_params,  # k→z predictor for GN initialization
 }
 CKPT_PATH = SCRIPT_DIR / 'checkpoint.pkl'
 with open(CKPT_PATH, 'wb') as f:
     pickle.dump(ckpt, f)
 print(f"\n  Checkpoint saved: {CKPT_PATH}")
-print("  Keys: params, batch_stats, model_cfg, normalization")
+print("  Keys: params, batch_stats, model_cfg, normalization, kz_predictor")
 print("  Normalization: k²-scaling (multiply by k1²+k2²+k3² before encode, divide after decode)")
 print("  Load with:  import pickle; ck = pickle.load(open('...', 'rb'))")
