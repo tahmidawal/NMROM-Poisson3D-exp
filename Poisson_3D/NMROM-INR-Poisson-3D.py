@@ -250,10 +250,14 @@ def constrained_decode(z):
 #    (needed for EQ integrand computation)
 # ─────────────────────────────────────────
 print("\n--- Rebuilding training snapshots (Analytical, k²-normalized) ---")
-train_ks = [(k1,k2,k3)
-            for k1 in range(1,5)
-            for k2 in range(1,5)
-            for k3 in range(1,5)]   # 64 snapshots — k=5 held out for testing
+import random as _random
+_random.seed(42)
+_all_interior = [(k1,k2,k3) for k1 in range(1,6) for k2 in range(1,6) for k3 in range(1,6)
+                 if k1 in {2,3,4} and k2 in {2,3,4} and k3 in {2,3,4}]
+_test_set = set(_random.sample(_all_interior, 15))
+
+train_ks = [(k1,k2,k3) for k1 in range(1,6) for k2 in range(1,6) for k3 in range(1,6)
+            if (k1,k2,k3) not in _test_set]   # 110 snapshots — 15 interior points held out
 
 U_train_list = []
 scale_factors_train = []
@@ -486,14 +490,9 @@ print("   Warm-up complete.\n")
 # ─────────────────────────────────────────
 print("--- Benchmark ---")
 
-test_ks = [
-    # In-distribution (seen during training, k in {1..4}^3)
-    (1,1,1), (2,2,2), (3,3,3), (4,4,4),
-    (1,2,3), (2,3,4), (3,4,1), (1,1,2),
-    # Extrapolation (k=5 never seen during training)
-    (5,1,1), (5,5,5), (1,5,1), (1,1,5),
-    (5,3,2), (1,2,5), (3,5,2), (5,4,3),
-]
+# Test set: the exact 15 interior points held out from training.
+# All have k1,k2,k3 ∈ {2,3,4} — surrounded by training neighbors in every direction.
+test_ks = sorted(_test_set)
 
 fom_times, rom_times         = [], []
 fom_vs_exact_errors          = []
