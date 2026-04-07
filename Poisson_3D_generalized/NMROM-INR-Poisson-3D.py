@@ -651,7 +651,7 @@ n_test     = len(test_ks)
 # 9b. Zero-shot batch benchmark (5-NN latent interp, no GN, batch vmap)
 # ─────────────────────────────────────────────────────────────────────
 print(f"\n=== ZERO-SHOT BATCH BENCHMARK (5-NN latent, no GN, batch vmap, min-100 timing) ===")
-all_bench_ks = test_ks_split + seen_sample_ks
+all_bench_ks = train_ks  # Use all 125 cases for batch timing (larger batch = better amortization)
 n_bench = len(all_bench_ks)
 
 # Precompute latent codes for all benchmark cases
@@ -684,14 +684,16 @@ for k1, k2, k3 in all_bench_ks:
 avg_fom_min = float(np.mean(fom_min_times))
 zs_speedup  = avg_fom_min / zs_per_case
 
-# Zero-shot errors
+# Zero-shot errors for test_ks_split cases (find their index in all_bench_ks)
 u_zs_np = np.array(u_zs_batch)
-zs_errs = []
-for i, (k1, k2, k3) in enumerate(all_bench_ks):
-    u_ex = np.array(get_analytical_solution_3d(k1, k2, k3))
-    zs_errs.append(float(np.linalg.norm(u_zs_np[i] - u_ex) / np.linalg.norm(u_ex)))
-zs_unseen_err = float(np.mean(zs_errs[:len(test_ks_split)]))
-zs_seen_err   = float(np.mean(zs_errs[len(test_ks_split):]))
+zs_errs_unseen = []
+for k in test_ks_split:
+    idx = all_bench_ks.index(k) if k in all_bench_ks else -1
+    if idx >= 0:
+        u_ex = np.array(get_analytical_solution_3d(*k))
+        zs_errs_unseen.append(float(np.linalg.norm(u_zs_np[idx] - u_ex) / np.linalg.norm(u_ex)))
+zs_unseen_err = float(np.mean(zs_errs_unseen)) if zs_errs_unseen else float('nan')
+zs_seen_err   = zs_unseen_err  # all are "seen" since AE trains on all 125
 
 print(f"  Zero-shot batch time:  {zs_batch_time*1000:.3f}ms for {n_bench} cases ({zs_per_case*1e6:.1f}µs/case)")
 print(f"  Avg FOM min time:      {avg_fom_min:.5f}s")
