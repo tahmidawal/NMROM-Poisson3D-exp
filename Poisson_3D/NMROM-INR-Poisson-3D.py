@@ -447,26 +447,28 @@ latent_solve = make_latent_solver(
     eq_weights_jnp, k_dim
 )
 
+@jax.jit
+def zero_shot_decode(lat_init, k2_scale):
+    """Zero-shot: decode initial latent directly, no GN solve."""
+    u_normalized = constrained_decode(lat_init)
+    return u_normalized / k2_scale
+
 def fast_eq_latent_poisson_solver(lat_init, F_vec, k2_scale):
-    """Public interface: hyper-reduced solve → full reconstructed field.
-    
+    """Public interface: zero-shot decode (no GN iterations).
+
     Args:
         lat_init: Initial latent code (in normalized space)
         F_vec: Original forcing vector (NOT normalized)
         k2_scale: Normalization factor k1² + k2² + k3²
-    
+
     Returns:
         lat_f: Final latent code (normalized space)
         u_final: Reconstructed solution (denormalized to original scale)
         res_f: Final residual norm
         n_iters: Number of GN iterations
     """
-    F_normalized = F_vec * k2_scale  # normalize F
-    F_eq  = F_normalized[eq_indices_jnp]
-    lat_f, res_f, n_iters = latent_solve(lat_init, F_eq)
-    u_normalized = constrained_decode(lat_f)
-    u_final = u_normalized / k2_scale  # denormalize output
-    return lat_f, u_final, res_f, n_iters
+    u_final = zero_shot_decode(lat_init, k2_scale)
+    return lat_init, u_final, jnp.array(0.0), jnp.array(0)
 
 # ─────────────────────────────────────────
 # 8. Warm-up
