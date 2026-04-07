@@ -516,15 +516,18 @@ for i, (k1,k2,k3) in enumerate(test_ks):
     fom_t = time.perf_counter() - t0
     fom_times.append(fom_t)
 
-    # Latent init — inverse-distance weighted interpolation of 2 nearest snapshots
+    # Latent init — inverse-distance weighted interpolation of 3 nearest snapshots
     dists     = [(k1-a)**2 + (k2-b)**2 + (k3-c)**2 for a,b,c in train_ks]
     sorted_i  = np.argsort(dists)
-    i1, i2    = sorted_i[0], sorted_i[1]
-    d1, d2    = np.sqrt(dists[i1]), np.sqrt(dists[i2])
-    dsum      = d1 + d2
-    w1        = d2 / dsum if dsum > 1e-12 else 0.5
-    w2        = d1 / dsum if dsum > 1e-12 else 0.5
-    lat_init  = w1 * encode(U_train[i1]) + w2 * encode(U_train[i2])
+    idx3      = sorted_i[:3]
+    raw_d     = np.array([np.sqrt(dists[ii]) for ii in idx3])
+    # If any distance is 0 (exact match), use that snapshot alone
+    if raw_d[0] < 1e-12:
+        lat_init = encode(U_train[idx3[0]])
+    else:
+        inv_d = 1.0 / (raw_d + 1e-12)
+        ws    = inv_d / inv_d.sum()
+        lat_init = sum(ws[j] * encode(U_train[idx3[j]]) for j in range(3))
 
     # ROM (with k² normalization)
     t0 = time.perf_counter()
