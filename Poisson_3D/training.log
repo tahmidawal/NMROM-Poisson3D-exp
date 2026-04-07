@@ -1,0 +1,89 @@
+Grid: 32³ = 32,768 nodes
+
+── Parameter Scaling Comparison ──────────────────────
+Grid           Dense AE    Scalable AE    Ratio
+────────────────────────────────────────────────
+32³          68,429,824        571,765     120×
+64³         538,191,872        596,341     902×
+128³       4,296,288,256        645,493    6656×
+────────────────────────────────────────────────
+
+── Generating Snapshots (Analytical, k²-normalized) ───
+  16/125 snapshots done
+  32/125 snapshots done
+  48/125 snapshots done
+  64/125 snapshots done
+  80/125 snapshots done
+  96/125 snapshots done
+  112/125 snapshots done
+  Dataset shape: (125, 32768)
+  Scale factors range: [3, 75]
+  Validation snapshots: 4
+
+  Scalable AE parameters: 573,481
+  Dense AE equivalent:    68,429,824
+  Reduction:              119×
+
+── Training ──────────────────────────────────────────
+  Epoch     0 | train 1.1667e-01 | val 1.1667e-01 | 4.6s
+  Epoch  1000 | train 3.7828e-02 | val 1.6115e-02 | 7.9s
+  Epoch  2000 | train 1.1133e-02 | val 6.3182e-03 | 11.1s
+  Epoch  3000 | train 1.9710e-03 | val 4.9206e-04 | 14.4s
+  Epoch  4000 | train 2.3400e-04 | val 8.7408e-05 | 17.7s
+  Epoch  5000 | train 1.9529e-04 | val 1.3796e-04 | 21.0s
+  Epoch  6000 | train 5.4268e-05 | val 4.5916e-05 | 24.2s
+  Epoch  7000 | train 1.9584e-05 | val 1.0133e-05 | 27.5s
+  Epoch  8000 | train 9.2596e-06 | val 2.2655e-06 | 30.8s
+  Epoch  9000 | train 6.5751e-06 | val 1.0871e-06 | 34.0s
+  Epoch 10000 | train 5.8492e-06 | val 1.1461e-06 | 37.3s
+  Epoch 11000 | train 5.5350e-06 | val 1.0124e-06 | 40.6s
+  Epoch 12000 | train 4.9750e-06 | val 1.1483e-06 | 43.9s
+  Epoch 13000 | train 4.6004e-06 | val 1.3142e-06 | 47.1s
+  Epoch 14000 | train 4.1628e-06 | val 2.0061e-06 | 50.4s
+  Epoch 15000 | train 3.6102e-06 | val 1.7701e-06 | 53.7s
+  Epoch 16000 | train 3.2494e-06 | val 1.6826e-06 | 56.9s
+  Epoch 17000 | train 3.0933e-06 | val 1.6628e-06 | 60.2s
+  Epoch 18000 | train 2.6267e-06 | val 1.2589e-06 | 63.5s
+  Epoch 19000 | train 2.5591e-06 | val 1.5670e-06 | 66.8s
+  Epoch 20000 | train 2.3641e-06 | val 1.2160e-06 | 70.0s
+
+  Total training time: 70.0s
+
+── Reconstruction Errors ─────────────────────────────
+
+  Case            Rel L2 (normalized)   Rel L2 (denorm vs exact)
+  ──────────────────────────────────────────────────────────────
+  (1,2,4)                    4.1832e-03                 4.1832e-03
+  (3,1,2)                    3.7119e-03                 3.7119e-03
+  (4,3,2)                    3.1521e-03                 3.1521e-03
+  (2,4,1)                    2.2240e-03                 2.2240e-03
+
+  Mean train reconstruction: 4.0421e-03
+  Mean val   reconstruction: 3.3178e-03
+
+── Latent Interpolation Check ────────────────────────
+  Saved: /cluster/tufts/paralab/tawal01/NMROM/Non-linear-Manifold-Reduced-Order-Modeling-for-Elliptic-and-Parabolic-PDEs-via-JAX/Research/Poisson_3D/plots/latent_interpolation.png
+  Saved: /cluster/tufts/paralab/tawal01/NMROM/Non-linear-Manifold-Reduced-Order-Modeling-for-Elliptic-and-Parabolic-PDEs-via-JAX/Research/Poisson_3D/plots/loss_curve.png
+  Saved: /cluster/tufts/paralab/tawal01/NMROM/Non-linear-Manifold-Reduced-Order-Modeling-for-Elliptic-and-Parabolic-PDEs-via-JAX/Research/Poisson_3D/plots/slice_k123.png
+  Saved: /cluster/tufts/paralab/tawal01/NMROM/Non-linear-Manifold-Reduced-Order-Modeling-for-Elliptic-and-Parabolic-PDEs-via-JAX/Research/Poisson_3D/plots/slice_k333.png
+  Saved: /cluster/tufts/paralab/tawal01/NMROM/Non-linear-Manifold-Reduced-Order-Modeling-for-Elliptic-and-Parabolic-PDEs-via-JAX/Research/Poisson_3D/plots/slice_k412.png
+  Saved: /cluster/tufts/paralab/tawal01/NMROM/Non-linear-Manifold-Reduced-Order-Modeling-for-Elliptic-and-Parabolic-PDEs-via-JAX/Research/Poisson_3D/plots/reconstruction_error.png
+
+=======================================================
+  ScalableAutoencoder — Training Summary
+=======================================================
+  Grid:                   32³ = 32,768 DOF
+  Latent dim:             20
+  CP rank:                256
+  Model params:           573,481
+  Dense AE params:        68,429,824
+  Param reduction:        119×
+  Mean train rec error:   4.0421e-03
+  Mean val   rec error:   3.3178e-03
+  Plots saved to:         /cluster/tufts/paralab/tawal01/NMROM/Non-linear-Manifold-Reduced-Order-Modeling-for-Elliptic-and-Parabolic-PDEs-via-JAX/Research/Poisson_3D/plots/
+=======================================================
+
+  Checkpoint saved: /cluster/tufts/paralab/tawal01/NMROM/Non-linear-Manifold-Reduced-Order-Modeling-for-Elliptic-and-Parabolic-PDEs-via-JAX/Research/Poisson_3D/checkpoint.pkl
+  Keys: params, batch_stats, model_cfg, normalization
+  Normalization: k²-scaling (multiply by k1²+k2²+k3² before encode, divide after decode)
+  Load with:  import pickle; ck = pickle.load(open('...', 'rb'))

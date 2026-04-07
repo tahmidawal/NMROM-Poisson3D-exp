@@ -1,0 +1,76 @@
+3D Domain: 32³ = 32,768 nodes
+Interior : 27,000  |  Boundary: 5,768
+
+--- Loading checkpoint from /cluster/tufts/paralab/tawal01/NMROM/Non-linear-Manifold-Reduced-Order-Modeling-for-Elliptic-and-Parabolic-PDEs-via-JAX/Research/Poisson_3D/checkpoint.pkl ---
+   Latent dim : 20
+   CP rank    : 256
+   Grid size  : 32
+
+--- Rebuilding training snapshots (Analytical, k²-normalized) ---
+   25/125 snapshots
+   50/125 snapshots
+   75/125 snapshots
+   100/125 snapshots
+   125/125 snapshots
+   Shape: (125, 32768)
+   Scale factors range: [3, 75]
+
+--- Empirical Quadrature: Offline Phase ---
+   Computing integrand matrices...
+   25/125 integrands done
+   50/125 integrands done
+   75/125 integrands done
+   100/125 integrands done
+   125/125 integrands done
+   Running NNLS (JAX GPU projected gradient)...
+   Nodes reduced: 32,768 → 26999  (82.394%)
+
+--- Precomputing V_eq (separable sparse factors) ---
+   V_eq shape : (256, 188993)   (rank × num_eq*7)
+   EQ points  : 26999
+
+--- Building hyper-reduced solver ---
+
+--- Warming up JAX compilers ---
+   Warm-up complete.
+
+--- Benchmark ---
+  [ 1/14] k=(1,1,1) | FOM 0.8484s | ROM 0.0577s | FOM-exact 8.557e-04 | ROM-exact 4.220e-03 | GN itr 30
+  [ 2/14] k=(2,2,2) | FOM 0.7425s | ROM 0.0547s | FOM-exact 3.430e-03 | ROM-exact 2.822e-03 | GN itr 30
+  [ 3/14] k=(3,3,3) | FOM 0.7532s | ROM 0.0557s | FOM-exact 7.738e-03 | ROM-exact 7.874e-03 | GN itr 30
+  [ 4/14] k=(4,4,4) | FOM 0.7215s | ROM 0.0548s | FOM-exact 1.381e-02 | ROM-exact 1.360e-02 | GN itr 30
+  [ 5/14] k=(1,2,3) | FOM 0.8296s | ROM 0.0558s | FOM-exact 6.010e-03 | ROM-exact 6.285e-03 | GN itr 30
+  [ 6/14] k=(2,3,4) | FOM 0.7304s | ROM 0.0553s | FOM-exact 1.048e-02 | ROM-exact 1.058e-02 | GN itr 30
+  [ 7/14] k=(3,4,1) | FOM 0.7189s | ROM 0.0545s | FOM-exact 1.120e-02 | ROM-exact 1.132e-02 | GN itr 30
+  [ 8/14] k=(5,5,5) | FOM 0.8728s | ROM 0.0562s | FOM-exact 2.167e-02 | ROM-exact 2.281e-02 | GN itr 30
+  [ 9/14] k=(1,2,5) | FOM 0.7401s | ROM 0.0545s | FOM-exact 1.850e-02 | ROM-exact 1.848e-02 | GN itr 30
+  [10/14] k=(3,5,2) | FOM 0.7131s | ROM 0.0544s | FOM-exact 1.640e-02 | ROM-exact 1.697e-02 | GN itr 30
+  [11/14] k=(1,1,2) | FOM 0.7253s | ROM 0.0552s | FOM-exact 2.570e-03 | ROM-exact 2.908e-03 | GN itr 30
+  [12/14] k=(2,2,3) | FOM 0.8577s | ROM 0.0560s | FOM-exact 5.706e-03 | ROM-exact 5.464e-03 | GN itr 30
+  [13/14] k=(3,3,4) | FOM 0.7355s | ROM 0.0555s | FOM-exact 1.059e-02 | ROM-exact 1.068e-02 | GN itr 30
+  [14/14] k=(1,2,2) | FOM 0.7436s | ROM 0.0558s | FOM-exact 3.144e-03 | ROM-exact 2.656e-03 | GN itr 30
+
+============================================================
+   3D Poisson  —  Scalable EQ-ROM Benchmark (k²-normalized)
+============================================================
+  Grid:                  32³ = 32,768 DOF
+  Latent dim:            20
+  CP rank:               256
+  EQ nodes:              26999 / 32768 (82.394%)
+------------------------------------------------------------
+  Avg FOM time:          0.76662 s
+  Avg ROM time:          0.05543 s
+  Avg speedup:           13.83×
+------------------------------------------------------------
+  FOM vs analytical:     9.4351e-03
+  ROM vs analytical:     9.7612e-03  (primary)
+============================================================
+
+Saved: /cluster/tufts/paralab/tawal01/NMROM/Non-linear-Manifold-Reduced-Order-Modeling-for-Elliptic-and-Parabolic-PDEs-via-JAX/Research/Poisson_3D/plots/benchmark_error.png
+Saved: /cluster/tufts/paralab/tawal01/NMROM/Non-linear-Manifold-Reduced-Order-Modeling-for-Elliptic-and-Parabolic-PDEs-via-JAX/Research/Poisson_3D/plots/benchmark_time.png
+Saved: /cluster/tufts/paralab/tawal01/NMROM/Non-linear-Manifold-Reduced-Order-Modeling-for-Elliptic-and-Parabolic-PDEs-via-JAX/Research/Poisson_3D/plots/benchmark_speedup.png
+
+--- Combined midplane slice plot (all 14 tests) ---
+   Saved: /cluster/tufts/paralab/tawal01/NMROM/Non-linear-Manifold-Reduced-Order-Modeling-for-Elliptic-and-Parabolic-PDEs-via-JAX/Research/Poisson_3D/plots/combined_slices_all.png
+
+=== Scalable EQ-ROM Complete ===
