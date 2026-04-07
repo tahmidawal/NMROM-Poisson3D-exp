@@ -296,7 +296,7 @@ model = ScalableAutoencoder(
     latent_dim    = k_dim,
     rank          = 256,
     grid_size     = N,
-    conv_features = (32, 64, 128),
+    conv_features = (16, 32, 64),
     hidden_dims   = (256, 512),
 )
 
@@ -583,7 +583,7 @@ ckpt = {
         latent_dim    = k_dim,
         rank          = 256,
         grid_size     = N,
-        conv_features = (32, 64, 128),
+        conv_features = (16, 32, 64),
         hidden_dims   = (256, 512),
     ),
     'normalization': {
