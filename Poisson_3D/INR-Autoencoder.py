@@ -258,29 +258,47 @@ _all_interior = [(k1,k2,k3) for k1 in range(1,6) for k2 in range(1,6) for k3 in 
                  if k1 in {2,3,4} and k2 in {2,3,4} and k3 in {2,3,4}]
 _test_set = set(_random.sample(_all_interior, 15))
 
-train_ks = [(k1,k2,k3) for k1 in range(1,6) for k2 in range(1,6) for k3 in range(1,6)
-            if (k1,k2,k3) not in _test_set]   # 110 snapshots
+train_ks_int = [(k1,k2,k3) for k1 in range(1,6) for k2 in range(1,6) for k3 in range(1,6)
+                if (k1,k2,k3) not in _test_set]   # 110 integer snapshots
 
 def get_k2_scale(k1, k2, k3):
     """Return normalization factor: k1² + k2² + k3².
     Analytical solution scales as 1/k², so multiplying by k² normalizes."""
     return float(k1**2 + k2**2 + k3**2)
 
+# Augment with half-integer k values to teach latent-space smoothness.
+# The analytical solution works for any real k: u = 10/(k²π²) sin(k1πx)sin(k2πy)sin(k3πz).
+# Add midpoints between adjacent integer grid points in each dimension.
+_half = [1.5, 2.5, 3.5, 4.5]
+_aug_ks = []
+# Vary one dim at a time (holds other two at integer values)
+for k_h in _half:
+    for k2 in [2, 3, 4]:
+        for k3 in [2, 3, 4]:
+            _aug_ks.append((k_h, k2, k3))
+            _aug_ks.append((k2, k_h, k3))
+            _aug_ks.append((k2, k3, k_h))
+# Remove duplicates
+_aug_ks = list(dict.fromkeys(_aug_ks))
+print(f"  Augmented with {len(_aug_ks)} half-integer snapshots")
+
+train_ks = train_ks_int + _aug_ks  # total: 110 + augmented
+
 U_list = []
 scale_factors = []  # store k² for each snapshot
 for i, (k1,k2,k3) in enumerate(train_ks):
-    u = get_exact(k1, k2, k3)              # use analytical solution
+    u = get_exact(k1, k2, k3)              # analytical solution (works for real k)
     k2_scale = get_k2_scale(k1, k2, k3)
     u_normalized = u * k2_scale            # normalize by k²
     U_list.append(u_normalized)
     scale_factors.append(k2_scale)
-    if (i+1) % 16 == 0:
+    if (i+1) % 32 == 0:
         print(f"  {i+1}/{len(train_ks)} snapshots done")
 
-U_train = jnp.stack(U_list)               # (64, num_nodes) — normalized
+U_train = jnp.stack(U_list)               # (N_train, num_nodes) — normalized
 scale_factors_train = jnp.array(scale_factors)
 print(f"  Dataset shape: {U_train.shape}")
-print(f"  Scale factors range: [{scale_factors_train.min():.0f}, {scale_factors_train.max():.0f}]")
+print(f"  Scale factors range: [{scale_factors_train.min():.1f}, {scale_factors_train.max():.1f}]")
 
 # Validation: a few cases from training set (not in _test_set, boundary cases are safe)
 val_ks   = [(1,2,5), (5,1,3), (4,5,2), (1,5,4)]
@@ -296,13 +314,13 @@ print(f"  Validation snapshots: {len(val_ks)}")
 # `batch_stats`. Flax requires you to separate trainable params from
 # this mutable state and update it explicitly each step.
 # ─────────────────────────────────────────────────────────────────────
-k_dim = 20
+k_dim = 32
 
 model = ScalableAutoencoder(
     latent_dim    = k_dim,
-    rank          = 256,
+    rank          = 512,
     grid_size     = N,
-    conv_features = (16, 32, 64),
+    conv_features = (32, 64, 128),
     hidden_dims   = (256, 512),
 )
 
@@ -327,7 +345,7 @@ schedule = optax.warmup_cosine_decay_schedule(
     init_value   = 0.0,
     peak_value   = 1e-3,
     warmup_steps = 500,
-    decay_steps  = 10_000,
+    decay_steps  = 30_000,
     end_value    = 1e-5,
 )
 tx        = optax.adam(schedule)
@@ -386,7 +404,7 @@ def relative_l2(u_pred, u_true):
 # 8. Training Loop
 # ─────────────────────────────────────────
 print("\n── Training ──────────────────────────────────────────")
-NUM_EPOCHS  = 20_000
+NUM_EPOCHS  = 30_000
 LOG_EVERY   = 1_000
 
 train_losses = []
@@ -457,7 +475,7 @@ print(f"  Mean val   reconstruction: {np.mean(val_errs):.4e}")
 # ─────────────────────────────────────────
 print("\n── Latent Interpolation Check ────────────────────────")
 z_a = encode(U_train[0])   # k=(1,1,1)
-z_b = encode(U_train[63])  # k=(4,4,4)
+z_b = encode(U_train[min(63, len(train_ks)-1)])  # near k=(4,4,4)
 
 alphas  = [0.0, 0.25, 0.5, 0.75, 1.0]
 mid     = N // 2
@@ -569,7 +587,7 @@ print(f"  ScalableAutoencoder — Training Summary")
 print(f"{'='*55}")
 print(f"  Grid:                   {N}³ = {num_nodes:,} DOF")
 print(f"  Latent dim:             {k_dim}")
-print(f"  CP rank:                256")
+print(f"  CP rank:                512")
 print(f"  Model params:           {n_params:,}")
 print(f"  Dense AE params:        {param_count_dense(num_nodes):,}")
 print(f"  Param reduction:        {param_count_dense(num_nodes)/n_params:.0f}×")
@@ -587,9 +605,9 @@ ckpt = {
     'batch_stats': batch_stats,
     'model_cfg': dict(
         latent_dim    = k_dim,
-        rank          = 256,
+        rank          = 512,
         grid_size     = N,
-        conv_features = (16, 32, 64),
+        conv_features = (32, 64, 128),
         hidden_dims   = (256, 512),
     ),
     'normalization': {

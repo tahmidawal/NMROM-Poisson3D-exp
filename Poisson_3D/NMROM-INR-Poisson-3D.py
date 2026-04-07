@@ -256,8 +256,21 @@ _all_interior = [(k1,k2,k3) for k1 in range(1,6) for k2 in range(1,6) for k3 in 
                  if k1 in {2,3,4} and k2 in {2,3,4} and k3 in {2,3,4}]
 _test_set = set(_random.sample(_all_interior, 15))
 
-train_ks = [(k1,k2,k3) for k1 in range(1,6) for k2 in range(1,6) for k3 in range(1,6)
-            if (k1,k2,k3) not in _test_set]   # 110 snapshots — 15 interior points held out
+train_ks_int = [(k1,k2,k3) for k1 in range(1,6) for k2 in range(1,6) for k3 in range(1,6)
+                if (k1,k2,k3) not in _test_set]   # 110 integer snapshots
+
+# Half-integer augmented snapshots (must match INR-Autoencoder.py)
+_half = [1.5, 2.5, 3.5, 4.5]
+_aug_ks = []
+for k_h in _half:
+    for k2 in [2, 3, 4]:
+        for k3 in [2, 3, 4]:
+            _aug_ks.append((k_h, k2, k3))
+            _aug_ks.append((k2, k_h, k3))
+            _aug_ks.append((k2, k3, k_h))
+_aug_ks = list(dict.fromkeys(_aug_ks))
+
+train_ks = train_ks_int + _aug_ks  # same as AE training
 
 U_train_list = []
 scale_factors_train = []
@@ -267,13 +280,13 @@ for i, (k1,k2,k3) in enumerate(train_ks):
     u_normalized = u * k2_scale  # normalize by k²
     U_train_list.append(u_normalized)
     scale_factors_train.append(k2_scale)
-    if (i+1) % 25 == 0:
+    if (i+1) % 40 == 0:
         print(f"   {i+1}/{len(train_ks)} snapshots")
 
 U_train = jnp.stack(U_train_list)
 scale_factors_train = jnp.array(scale_factors_train)
 print(f"   Shape: {U_train.shape}")
-print(f"   Scale factors range: [{scale_factors_train.min():.0f}, {scale_factors_train.max():.0f}]")
+print(f"   Scale factors range: [{scale_factors_train.min():.1f}, {scale_factors_train.max():.1f}]")
 
 # ─────────────────────────────────────────────────────────────────────
 # 5. Empirical Quadrature — Offline Phase
@@ -511,15 +524,19 @@ for i, (k1,k2,k3) in enumerate(test_ks):
     fom_t = time.perf_counter() - t0
     fom_times.append(fom_t)
 
-    # Latent init — inverse-distance weighted interpolation of 2 nearest snapshots
-    dists     = [(k1-a)**2 + (k2-b)**2 + (k3-c)**2 for a,b,c in train_ks]
+    # Latent init — inverse-distance weighted interpolation of 6 nearest snapshots
+    dists     = np.array([(k1-a)**2 + (k2-b)**2 + (k3-c)**2 for a,b,c in train_ks])
     sorted_i  = np.argsort(dists)
-    i1, i2    = sorted_i[0], sorted_i[1]
-    d1, d2    = np.sqrt(dists[i1]), np.sqrt(dists[i2])
-    dsum      = d1 + d2
-    w1        = d2 / dsum if dsum > 1e-12 else 0.5
-    w2        = d1 / dsum if dsum > 1e-12 else 0.5
-    lat_init  = w1 * encode(U_train[i1]) + w2 * encode(U_train[i2])
+    K_nn      = min(6, len(train_ks))
+    nn_idx    = sorted_i[:K_nn]
+    nn_dists  = np.sqrt(dists[nn_idx])
+    # Inverse-distance weighting; if exact match, use that snapshot
+    if nn_dists[0] < 1e-10:
+        lat_init = encode(U_train[nn_idx[0]])
+    else:
+        inv_w = 1.0 / (nn_dists + 1e-12)
+        inv_w /= inv_w.sum()
+        lat_init = sum(w * encode(U_train[j]) for w, j in zip(inv_w, nn_idx))
 
     # ROM (with k² normalization)
     t0 = time.perf_counter()
