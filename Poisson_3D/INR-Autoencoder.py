@@ -251,9 +251,9 @@ print("─" * 48)
 # ─────────────────────────────────────────
 print("\n── Generating Snapshots (Analytical, k²-normalized) ───")
 train_ks = [(k1,k2,k3)
-            for k1 in range(1,6)
-            for k2 in range(1,6)
-            for k3 in range(1,6)]          # 125 snapshots
+            for k1 in range(1,5)
+            for k2 in range(1,5)
+            for k3 in range(1,5)]          # 64 snapshots, k=5 held out for testing
 
 def get_k2_scale(k1, k2, k3):
     """Return normalization factor: k1² + k2² + k3².
@@ -276,7 +276,7 @@ scale_factors_train = jnp.array(scale_factors)
 print(f"  Dataset shape: {U_train.shape}")
 print(f"  Scale factors range: [{scale_factors_train.min():.0f}, {scale_factors_train.max():.0f}]")
 
-# Hold out a few cases for validation
+# Hold out a few cases for validation (all within {1..4}^3, not touching k=5)
 val_ks   = [(1,2,4), (3,1,2), (4,3,2), (2,4,1)]
 U_val_raw = jnp.stack([get_exact(*k) for k in val_ks])
 scale_factors_val = jnp.array([get_k2_scale(*k) for k in val_ks])

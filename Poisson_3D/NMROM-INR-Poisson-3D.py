@@ -251,9 +251,9 @@ def constrained_decode(z):
 # ─────────────────────────────────────────
 print("\n--- Rebuilding training snapshots (Analytical, k²-normalized) ---")
 train_ks = [(k1,k2,k3)
-            for k1 in range(1,6)
-            for k2 in range(1,6)
-            for k3 in range(1,6)]   # 125 snapshots — same as training
+            for k1 in range(1,5)
+            for k2 in range(1,5)
+            for k3 in range(1,5)]   # 64 snapshots — k=5 held out for testing
 
 U_train_list = []
 scale_factors_train = []
@@ -447,28 +447,26 @@ latent_solve = make_latent_solver(
     eq_weights_jnp, k_dim
 )
 
-@jax.jit
-def zero_shot_decode(lat_init, k2_scale):
-    """Zero-shot: decode initial latent directly, no GN solve."""
-    u_normalized = constrained_decode(lat_init)
-    return u_normalized / k2_scale
-
 def fast_eq_latent_poisson_solver(lat_init, F_vec, k2_scale):
-    """Public interface: zero-shot decode (no GN iterations).
-
+    """Public interface: hyper-reduced solve → full reconstructed field.
+    
     Args:
         lat_init: Initial latent code (in normalized space)
         F_vec: Original forcing vector (NOT normalized)
         k2_scale: Normalization factor k1² + k2² + k3²
-
+    
     Returns:
         lat_f: Final latent code (normalized space)
         u_final: Reconstructed solution (denormalized to original scale)
         res_f: Final residual norm
         n_iters: Number of GN iterations
     """
-    u_final = zero_shot_decode(lat_init, k2_scale)
-    return lat_init, u_final, jnp.array(0.0), jnp.array(0)
+    F_normalized = F_vec * k2_scale  # normalize F
+    F_eq  = F_normalized[eq_indices_jnp]
+    lat_f, res_f, n_iters = latent_solve(lat_init, F_eq)
+    u_normalized = constrained_decode(lat_f)
+    u_final = u_normalized / k2_scale  # denormalize output
+    return lat_f, u_final, res_f, n_iters
 
 # ─────────────────────────────────────────
 # 8. Warm-up
@@ -489,14 +487,12 @@ print("   Warm-up complete.\n")
 print("--- Benchmark ---")
 
 test_ks = [
-    # In-distribution
+    # In-distribution (seen during training, k in {1..4}^3)
     (1,1,1), (2,2,2), (3,3,3), (4,4,4),
-    # Interpolation (in training set)
-    (1,2,3), (2,3,4), (3,4,1),
-    # Mild extrapolation
-    (5,5,5), (1,2,5), (3,5,2),
-    # Mixed
-    (1,1,2), (2,2,3), (3,3,4), (1,2,2),
+    (1,2,3), (2,3,4), (3,4,1), (1,1,2),
+    # Extrapolation (k=5 never seen during training)
+    (5,1,1), (5,5,5), (1,5,1), (1,1,5),
+    (5,3,2), (1,2,5), (3,5,2), (5,4,3),
 ]
 
 fom_times, rom_times         = [], []
@@ -506,67 +502,32 @@ stored                       = {}
 n_test                       = len(test_ks)
 plot_at                      = set(range(n_test))  # Store all 14 for combined plot
 
-# Pre-compute all latent inits and k2_scales before timing
-lat_inits  = []
-k2_scales  = []
-for i, (k1,k2,k3) in enumerate(test_ks):
-    k2_scale = get_k2_scale(k1, k2, k3)
-    k2_scales.append(k2_scale)
-    dists     = [(k1-a)**2 + (k2-b)**2 + (k3-c)**2 for a,b,c in train_ks]
-    sorted_i  = np.argsort(dists)
-    idx5      = sorted_i[:5]
-    raw_d     = np.array([np.sqrt(dists[ii]) for ii in idx5])
-    if raw_d[0] < 1e-12:
-        lat_init = encode(U_train[idx5[0]])
-    else:
-        inv_d = 1.0 / (raw_d + 1e-12)
-        ws    = inv_d / inv_d.sum()
-        lat_init = sum(ws[j] * encode(U_train[idx5[j]]) for j in range(5))
-    lat_inits.append(lat_init)
-jax.block_until_ready(jnp.stack(lat_inits))
-
-# Batch ROM: vmap decode over all 14 latent inits at once
-lat_inits_batch  = jnp.stack(lat_inits)      # (14, k_dim)
-k2_scales_batch  = jnp.array(k2_scales)       # (14,)
-
-@jax.jit
-def batch_zero_shot_decode(lat_batch, k2_batch):
-    """Decode all 14 latents in one vmapped call."""
-    def single_decode(lat, k2):
-        return constrained_decode(lat) / k2
-    return jax.vmap(single_decode)(lat_batch, k2_batch)
-
-# Warmup batch decode (multiple warmups to stabilize GPU clocks)
-for _ in range(5):
-    _ = batch_zero_shot_decode(lat_inits_batch, k2_scales_batch).block_until_ready()
-
-# Time the batch ROM — take minimum over 100 runs for stable best-case measurement
-batch_times = []
-for _run in range(100):
-    t0_batch = time.perf_counter()
-    u_roms_batch = batch_zero_shot_decode(lat_inits_batch, k2_scales_batch).block_until_ready()
-    batch_times.append(time.perf_counter() - t0_batch)
-batch_rom_t = min(batch_times)  # best-case timing (minimum over runs)
-avg_rom_t_batch = batch_rom_t / n_test
-print(f"   Batch ROM: min {batch_rom_t*1000:.3f}ms over 100 runs, {n_test} cases → {avg_rom_t_batch*1000:.4f}ms/case")
-
 for i, (k1,k2,k3) in enumerate(test_ks):
     F_test = get_F_3d(k1, k2, k3)
-    k2_scale = k2_scales[i]
+    k2_scale = get_k2_scale(k1, k2, k3)
 
-    # FOM (for timing comparison only) — run 5 times, take minimum
-    _fom_times_per_case = []
-    for _ in range(5):
-        t0    = time.perf_counter()
-        u_fom = full_order_fem_solver_3d(F_test).block_until_ready()
-        _fom_times_per_case.append(time.perf_counter() - t0)
-    fom_t = float(np.min(_fom_times_per_case))
+    # FOM (for timing comparison only)
+    t0    = time.perf_counter()
+    u_fom = full_order_fem_solver_3d(F_test).block_until_ready()
+    fom_t = time.perf_counter() - t0
     fom_times.append(fom_t)
 
-    # Use pre-batched ROM result
-    u_rom    = u_roms_batch[i]
-    rom_times.append(avg_rom_t_batch)  # per-case time from batch
-    lat_f, gn_res, n_iters = lat_inits[i], jnp.array(0.0), jnp.array(0)
+    # Latent init — inverse-distance weighted interpolation of 2 nearest snapshots
+    dists     = [(k1-a)**2 + (k2-b)**2 + (k3-c)**2 for a,b,c in train_ks]
+    sorted_i  = np.argsort(dists)
+    i1, i2    = sorted_i[0], sorted_i[1]
+    d1, d2    = np.sqrt(dists[i1]), np.sqrt(dists[i2])
+    dsum      = d1 + d2
+    w1        = d2 / dsum if dsum > 1e-12 else 0.5
+    w2        = d1 / dsum if dsum > 1e-12 else 0.5
+    lat_init  = w1 * encode(U_train[i1]) + w2 * encode(U_train[i2])
+
+    # ROM (with k² normalization)
+    t0 = time.perf_counter()
+    lat_f, u_rom, gn_res, n_iters = fast_eq_latent_poisson_solver(lat_init, F_test, k2_scale)
+    jax.block_until_ready(u_rom)
+    rom_t = time.perf_counter() - t0
+    rom_times.append(rom_t)
 
     # Errors — both compared against analytical (ground truth)
     u_exact      = get_analytical_solution_3d(k1, k2, k3)
@@ -579,7 +540,7 @@ for i, (k1,k2,k3) in enumerate(test_ks):
     rom_vs_exact_errors.append(err_rom_ex)
 
     print(f"  [{i+1:2d}/{n_test}] k=({k1},{k2},{k3}) | "
-          f"FOM {fom_t:.4f}s | ROM {avg_rom_t_batch:.4f}s | "
+          f"FOM {fom_t:.4f}s | ROM {rom_t:.4f}s | "
           f"FOM-exact {err_fom_ex:.3e} | ROM-exact {err_rom_ex:.3e} | GN itr {int(n_iters)}")
 
     if i in plot_at:
