@@ -536,15 +536,19 @@ def batch_zero_shot_decode(lat_batch, k2_batch):
         return constrained_decode(lat) / k2
     return jax.vmap(single_decode)(lat_batch, k2_batch)
 
-# Warmup batch decode
-_ = batch_zero_shot_decode(lat_inits_batch, k2_scales_batch).block_until_ready()
+# Warmup batch decode (multiple warmups to stabilize GPU clocks)
+for _ in range(5):
+    _ = batch_zero_shot_decode(lat_inits_batch, k2_scales_batch).block_until_ready()
 
-# Time the batch ROM
-t0_batch = time.perf_counter()
-u_roms_batch = batch_zero_shot_decode(lat_inits_batch, k2_scales_batch).block_until_ready()
-batch_rom_t = time.perf_counter() - t0_batch
+# Time the batch ROM — take minimum over 10 runs for stable measurement
+batch_times = []
+for _run in range(10):
+    t0_batch = time.perf_counter()
+    u_roms_batch = batch_zero_shot_decode(lat_inits_batch, k2_scales_batch).block_until_ready()
+    batch_times.append(time.perf_counter() - t0_batch)
+batch_rom_t = min(batch_times)  # best-case timing (minimum over runs)
 avg_rom_t_batch = batch_rom_t / n_test
-print(f"   Batch ROM: total {batch_rom_t*1000:.3f}ms for {n_test} cases → {avg_rom_t_batch*1000:.4f}ms/case")
+print(f"   Batch ROM: min {batch_rom_t*1000:.3f}ms over 10 runs, {n_test} cases → {avg_rom_t_batch*1000:.4f}ms/case")
 
 for i, (k1,k2,k3) in enumerate(test_ks):
     F_test = get_F_3d(k1, k2, k3)
