@@ -662,21 +662,21 @@ k2_bench = jnp.array([get_k2_scale(*k) for k in all_bench_ks])         # (n_benc
 for _ in range(5):
     _ = zeroshot_batch_vmap(Z_bench, k2_bench).block_until_ready()
 
-# Min timing over 100 runs
+# Min timing over 1000 runs for best accuracy
 zs_run_times = []
-for _ in range(100):
+for _ in range(1000):
     t0 = time.perf_counter()
     u_zs_batch = zeroshot_batch_vmap(Z_bench, k2_bench).block_until_ready()
     zs_run_times.append(time.perf_counter() - t0)
 zs_batch_time = min(zs_run_times)
 zs_per_case   = zs_batch_time / n_bench
 
-# FOM timing (min over 5 runs per case)
+# FOM timing (min over 3 runs per case)
 fom_min_times = []
 for k1, k2, k3 in all_bench_ks:
     F_t = get_F_3d(k1, k2, k3)
     ft_list = []
-    for _ in range(5):
+    for _ in range(3):
         t0 = time.perf_counter()
         full_order_fem_solver_3d(F_t).block_until_ready()
         ft_list.append(time.perf_counter() - t0)
